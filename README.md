@@ -10,7 +10,7 @@ Claude Code・Codex・Antigravity のセッションを、1つの画面で一覧
 
 - **一覧**：Claude Code / Codex / Antigravity のセッションを列ごとに表示（動作中・開いている・終わったもの）。5秒ごとに自動更新
 - **中身**：最後の指示と応答、使っているモデル、期間内のトークン数。長い応答は「全文」で展開、「応答をコピー」でコピー
-- **使用制限**：Codex と Antigravity の 5時間枠・週の枠。Claude は statusline を登録すると表示（後述）
+- **使用制限**：Claude・Codex・Antigravity の 5時間枠・週の枠
 - **開く**：ボタンで各アプリの該当チャットを開く
 - **返信**：ダッシュボードから CLI 経由で続きを送り、返事をカードに表示。画像の貼り付け添付にも対応
 - **ほかのマシン**：Tailscale でつながった自分の別のパソコン（Mac / Windows）のセッションも同じ画面に並べる
@@ -141,10 +141,15 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.agent-dashbo
 - Codex は、アプリで開いているスレッドに CLI から書き込めないため、そのときは自動で「開いてコピー」に切り替わります
 - Antigravity のアプリ（IDE）で作った会話は CLI から見えないため、返信できません
 
-## Claude の使用制限（5時間枠・週の枠）を表示する
+## Claude の使用制限（5時間枠・週の枠）
 
-Claude Code のステータスラインに渡される使用制限を `statusline.py` がファイルに書き出し、ダッシュボードが読みます。
-`~/.claude/settings.json` に次を追加します。
+設定は要りません。ダッシュボードが 5 分おきに `claude -p --no-session-persistence /usage` を動かして取得します
+（モデルは呼ばないので使用量は減りません。履歴ファイルも増えません）。デスクトップアプリだけを使っていても更新されます。
+
+**おまけ：ステータスライン**
+
+ターミナル版の Claude Code を使うなら、`statusline.py` をステータスラインに登録すると、画面下に「モデル · 5h 12% · 週 30%」と出て、
+そのたびにダッシュボードの数字も更新されます（/usage の取得と新しい方を使います）。`~/.claude/settings.json` に次を追加します。
 
 ```json
 "statusLine": {
@@ -153,7 +158,6 @@ Claude Code のステータスラインに渡される使用制限を `statuslin
 }
 ```
 
-数字が更新されるのは、ターミナル版の Claude Code でやりとりしたときです（デスクトップアプリはステータスラインを動かしません）。
 
 ## 安全について
 

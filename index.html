@@ -387,7 +387,7 @@ function usage(key, t, items) {
   items.forEach((i) => i.tokens && ["input", "output", "cache"].forEach((f) => (sum[f] += i.tokens[f])));
   let html = `<div class="usage"><div title="${tokTitle(sum)}">${DAYS_LABEL[$("#days").value] || ""}の入出力 <b>${fmtTok(ioTok(sum))}</b> tokens（キャッシュ読込 ${fmtTok(sum.cache)}）</div>`;
   if (t.limits) html += limitRow("5時間枠", t.limits.primary) + limitRow("週の枠", t.limits.secondary);
-  else if (key === "claude") html += `<div>5時間枠・週の枠は、statusline.py を登録すると表示されます</div>`;
+  else if (key === "claude") html += `<div>5時間枠・週の枠を取得中…</div>`;
   return html + `</div>`;
 }
 // Muse は会話がパソコンに残らないので、一覧ではなくアプリの呼び出し口だけ

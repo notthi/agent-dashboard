@@ -638,6 +638,60 @@ def agy_quota():
     return AGY_QUOTA["rows"]
 
 
+# `claude -p /usage` で使用制限を取る（モデルは呼ばないので枠は減らない）。デスクトップアプリだけを使っていても更新される。
+# --no-session-persistence を付けないと、実行のたびに履歴ファイルが1つ増えてしまう
+CLAUDE_USAGE = {"limits": None, "fetched": 0, "running": False}
+CLAUDE_USAGE_TTL = 5 * 60
+_USAGE_RE = re.compile(r"Current (session|week \(all models\)): (\d+)% used(?: · resets (.+?) \((.+?)\))?")
+
+
+def parse_reset(text, tz):
+    """「Oct 29 at 9:29am」「Nov 1 at 6am」「9:29am」をタイムスタンプにする"""
+    from zoneinfo import ZoneInfo
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:  # noqa: BLE001  タイムゾーン名が読めなければこのマシンの時刻で扱う
+        zone = None
+    now_dt = datetime.now(zone)
+    t = text.replace(" at ", " ").strip()
+    for fmt, has_date in (("%b %d %I:%M%p", True), ("%b %d %I%p", True), ("%I:%M%p", False), ("%I%p", False)):
+        try:
+            d = datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        d = d.replace(year=now_dt.year, tzinfo=zone) if has_date else \
+            d.replace(year=now_dt.year, month=now_dt.month, day=now_dt.day, tzinfo=zone)
+        if d.timestamp() < now_dt.timestamp() - 86400:  # 年をまたぐとき
+            d = d.replace(year=d.year + 1)
+        return d.timestamp()
+    return 0
+
+
+def refresh_claude_usage():
+    try:
+        p = subprocess.run([cli("claude"), "-p", "--no-session-persistence", "/usage"], capture_output=True,
+                           text=True, encoding="utf-8", errors="replace", timeout=60, cwd=str(HOME),
+                           env=CLI_ENV, **NO_WINDOW)
+        found = {}
+        for kind, pct, reset, tz in _USAGE_RE.findall(p.stdout):
+            found["primary" if kind == "session" else "secondary"] = {
+                "used_percent": int(pct), "resets_at": parse_reset(reset, tz) if reset else 0}
+        if found:
+            CLAUDE_USAGE["limits"] = {"ts": now(), **found}
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        CLAUDE_USAGE["fetched"] = now()
+        CLAUDE_USAGE["running"] = False
+
+
+def claude_usage_limits():
+    if not CLAUDE_USAGE["running"] and now() - CLAUDE_USAGE["fetched"] > CLAUDE_USAGE_TTL:
+        CLAUDE_USAGE["running"] = True
+        threading.Thread(target=refresh_claude_usage, daemon=True).start()
+    return CLAUDE_USAGE["limits"]
+
+
 CLAUDE_LIMITS = CACHE_DIR / "claude_rate_limits.json"
 
 
@@ -683,7 +737,8 @@ def snapshot(days, with_remote=True):
             # 使用制限はアカウント全体の値なので、いちばん新しい記録を採る
             limits = [i.pop("limits") for i in items if i.get("limits")]
             if name == "claude":
-                limits = [x for x in [claude_limits()] if x]
+                # statusline の記録と /usage のうち、新しい方を使う
+                limits = [x for x in [claude_limits(), claude_usage_limits() if with_remote else None] if x]
             if name == "antigravity" and with_remote:
                 out["tools"][name]["quota"] = agy_quota()
             if limits:
