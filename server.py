@@ -815,6 +815,10 @@ def merge_remote(out, days):
         for name, t in ((st["data"] or {}).get("tools") or {}).items():
             if name not in out["tools"]:
                 continue
+            # 使用制限はアカウント全体の値なので、どのマシンの記録でもいちばん新しいものを使う
+            rl, cur = t.get("limits"), out["tools"][name].get("limits")
+            if rl and rl.get("ts") and (not cur or rl["ts"] > (cur.get("ts") or 0)):
+                out["tools"][name]["limits"] = rl
             for i in t.get("items", []):
                 i["host"] = host["name"]
                 # アプリで開く・貼り付けはそのマシンの画面でしかできない。
