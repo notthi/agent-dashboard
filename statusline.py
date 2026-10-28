@@ -38,6 +38,7 @@ def main():
         w = (rl or {}).get(key) or {}
         if w.get("used_percentage") is not None:
             parts.append(f"{label} {round(w['used_percentage'])}%")
+    sys.stdout.reconfigure(encoding="utf-8")  # Windows の cp932 では「·」が出せない
     print(" · ".join(p for p in parts if p))
 
 
