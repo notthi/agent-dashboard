@@ -8,7 +8,7 @@
 :root {
   --bg: #f6f5f2; --panel: #ffffff; --line: #e4e1da; --text: #1f1e1c; --muted: #77736b;
   --claude: #c96442; --codex: #3d6fd8; --antigravity: #2f9e74; --muse: #8a5cf6;
-  --busy: #e0a100; --open: #3d9a5c; --done: #b5b0a6;
+  --busy: #e0a100; --open: #3d9a5c; --done: #b5b0a6; --ask: #d6336c;
 }
 @media (prefers-color-scheme: dark) {
   :root {
@@ -39,9 +39,14 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
   border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
 .card.done { border-left-color: var(--line); }
 .top { display: flex; gap: 8px; align-items: baseline; }
-.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; transform: translateY(-1px); background: var(--done); }
+.dot { width: 10px; height: 10px; border-radius: 50%; flex: none; transform: translateY(-1px); background: var(--done); }
 .busy .dot { background: var(--busy); box-shadow: 0 0 0 3px color-mix(in srgb, var(--busy) 25%, transparent); animation: pulse 1.6s infinite; }
 .open .dot { background: var(--open); }
+.ask .dot { background: var(--ask); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ask) 25%, transparent); }
+.card.ask { border-color: var(--ask); }
+.msg.question { white-space: pre-wrap; -webkit-line-clamp: 6; }
+.col h2 .asking { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--ask); }
+.col h2 .live + .asking { margin-left: 0; }
 @keyframes pulse { 50% { opacity: .45; } }
 .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
 .time { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
@@ -125,7 +130,7 @@ const TOOLS = [
   ["antigravity", "Antigravity", "var(--antigravity)"],
   ["muse", "Muse", "var(--muse)"],
 ];
-const STATE_LABEL = { busy: "動作中", open: "開いている", done: "", archived: "アーカイブ" };
+const STATE_LABEL = { ask: "質問あり", busy: "動作中", open: "開いている", done: "", archived: "アーカイブ" };
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
@@ -217,6 +222,7 @@ function card(it) {
     <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}</div>
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
+    ${it.question ? `<div class="msg question"><b>質問</b>${esc(it.question)}</div>` : ""}
     ${msgRow("指示", it.prompt, it.prompt_full, full)}
     ${msgRow("応答", it.reply, it.reply_full, full)}
     <div class="actions">
@@ -233,7 +239,7 @@ function card(it) {
       <div class="row"><span class="hint">${it.auto_paste
           ? "アプリでこのチャットを開き、貼り付けて送信します（チャットは止めません）"
           : stopDefault(it)
-          ? "アプリ側のチャットを止めて裏で送り、返事をここに表示します（アプリには「中断」と出ます。アプリで「表示 → 再読み込み」すると画面にも出ます）"
+          ? "アプリ側のチャットを止めて裏で送り、返事をここに表示します（送ったあと Claude アプリの画面を自動で再読み込みするので、アプリにも表示されます。アプリが手前にあるときは再読み込みしません。Remote Control は外れます）"
           : it.reply_mode === "bridge"
           ? "claude.ai で開き、本文をコピーします（貼り付けて送信）"
           : it.reply_mode === "paste"
@@ -241,7 +247,8 @@ function card(it) {
           : "CLI で続きを実行し、返事をここに表示します"}</span>
         <button data-act="cancel">やめる</button>${stopDefault(it)
           ? `<button data-act="send" title="アプリ（または claude.ai）で開いて、本文をコピーします">開いてコピー</button><button class="primary" data-act="stopsend">送信</button>`
-          : `<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
+          : `${it.auto_paste && it.can_stop_send
+            ? `<button data-act="stopsend" title="アプリ側のチャットを止めて裏で送ります。返事はここに出ます（アプリには「中断」と出ます）">止めて送る</button>` : ""}<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
     </div>` : ""}
     ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? "実行中…" : esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました"))}</div>
       ${job.status === "done" && job.output ? `<button class="copy" data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}</div>` : ""}
@@ -408,12 +415,14 @@ function column([key, name, color], data) {
   const all = t.items;
   const items = all.filter((i) => showAuto || !i.auto);
   const hidden = all.length - items.length;
-  const active = items.filter((i) => i.state === "busy" || i.state === "open");
+  // 質問に答えないと進まないものを先頭に
+  const active = items.filter((i) => i.state === "ask").concat(items.filter((i) => i.state === "busy" || i.state === "open"));
   const rest = items.filter((i) => !active.includes(i));
   const busy = items.filter((i) => i.state === "busy").length;
+  const asking = items.filter((i) => i.state === "ask").length;
   let html = `<section class="col" style="--c:${color}">
     <h2><span class="swatch"></span>${name}<span class="count">${items.length}件</span>
-    ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}</h2>` + usage(key, t, items);
+    ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}${asking ? `<span class="asking">● ${asking} 質問あり</span>` : ""}</h2>` + usage(key, t, items);
   if (t.error) html += `<div class="err">読み込みエラー: ${esc(t.error)}</div>`;
   if (active.length) html += `<div class="section-label">いま</div>` + active.map(card).join("");
   if (rest.length) {

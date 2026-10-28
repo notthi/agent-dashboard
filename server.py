@@ -173,6 +173,17 @@ def claude_text(content):
     return "\n".join(parts)
 
 
+def claude_question(content):
+    """アシスタントが AskUserQuestion で質問していれば、その質問と選択肢を1つの文にする"""
+    for c in content if isinstance(content, list) else []:
+        if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "AskUserQuestion":
+            qs = (c.get("input") or {}).get("questions") or []
+            return "\n".join(
+                (q.get("question") or "") + "\n選択肢: " + " / ".join(o.get("label", "") for o in q.get("options") or [])
+                for q in qs if isinstance(q, dict))
+    return None
+
+
 def stop_idle_session(sid):
     """アプリが開いたまま待機しているセッションのプロセスを止める。処理中なら止めない"""
     lv = claude_live().get(sid)
@@ -305,6 +316,9 @@ def codex_usage(path):
 DESKTOP_SESSIONS = CLAUDE_APP_DIR / "claude-code-sessions"
 
 
+DESKTOP_TITLES = {}  # CLI のセッション ID -> アプリでの題名。貼り付け前に、画面のチャットと照らし合わせる
+
+
 def claude_desktop_ids():
     """CLI のセッション ID -> デスクトップアプリ側の ID (local_…)。両者は一致しないことがある"""
     ids = {}
@@ -315,6 +329,7 @@ def claude_desktop_ids():
             continue
         if d.get("cliSessionId") and not d.get("isArchived"):
             ids[d["cliSessionId"]] = d.get("sessionId") or f.stem
+            DESKTOP_TITLES[d["cliSessionId"]] = d.get("title") or ""
     return ids
 
 
@@ -330,7 +345,7 @@ def collect_claude(since):
         sid = f.stem
         if mtime < since and sid not in live:
             continue
-        title = prompt = reply = cwd = entry = None
+        title = prompt = reply = cwd = entry = question = None
         sidechain_only = True
         turn_done = False  # 最後の発言が「応答し終えた」アシスタントか
         for d in tail_lines(f):
@@ -349,6 +364,7 @@ def collect_claude(since):
                 cwd = d.get("cwd") or cwd
                 if not d.get("isSidechain"):
                     sidechain_only = False
+                    question = None  # 次の user 行が来た＝質問に答えた
                     txt = claude_text(d.get("message", {}).get("content"))
                     if txt and not txt.lstrip().startswith("<"):
                         prompt = txt
@@ -356,11 +372,13 @@ def collect_claude(since):
                 txt = claude_text(d.get("message", {}).get("content"))
                 if txt.strip():
                     reply = txt
+                question = claude_question(d.get("message", {}).get("content")) or question
         lv = live.get(sid)
         if lv:
             cwd = lv.get("cwd") or cwd
             title = lv.get("name") or title
-            state = "busy" if lv.get("status") == "busy" else "open"
+            # 質問（AskUserQuestion）への答え待ちは、履歴に未回答の質問が残っていることで見分ける
+            state = "ask" if question else "busy" if lv.get("status") == "busy" else "open"
             updated = max(mtime, (lv.get("updatedAt") or 0) / 1000)
         else:
             # 最近書かれていても、応答し終えていれば待機中。ダッシュボードから送信中のものは処理中
@@ -383,6 +401,7 @@ def collect_claude(since):
             "reply": clip(reply),
             "prompt_full": full_text(prompt),
             "reply_full": full_text(reply),
+            "question": question if state == "ask" else None,
             "auto": bool(lv is None and sidechain_only),
             "via": (lv or {}).get("entrypoint") or entry or "",
             "live": lv is not None,
@@ -392,10 +411,14 @@ def collect_claude(since):
             # 開いているセッションへ CLI から書き込むと履歴が分岐するので、
             # その場合はアプリで開いて本文をクリップボードに入れるだけにする
             "reply_mode": "paste" if lv else "cli",
-            "can_reply": lv is not None or state != "busy",
+            # 質問の画面に文字を貼ると答え方が読めないので、質問中はアプリで答えてもらう
+            "can_reply": state != "ask" and (lv is not None or state != "busy"),
+            "no_reply": "質問が出ています。アプリで開いて答えてください" if state == "ask" else None,
             # 待機中ならアプリ側のプロセスを止めてから CLI で送れる（会話は1本のまま。アプリには「中断」と出る）
             "can_stop_send": lv is not None and state == "open",
             # Windows ではアプリでそのチャットを開き、貼り付けて Enter まで自動で押せる（止めずに同じ会話へ届く）
+            # Mac は止めている。自動起動から Claude アプリの画面情報を問い合わせると、長時間返ってこないことがあり、
+            # 宛先の確認を安定してできないため（誤送信を避けて「止めて送る」を既定にする）
             "auto_paste": IS_WIN and lv is not None and bool((lv or {}).get("hostSessionId") or desktop.get(sid)),
         }
     return sorted(items.values(), key=lambda x: -x["updated"])
@@ -956,13 +979,114 @@ def copy_and_open(item, text):
 
 
 PASTE_LOCK = threading.Lock()
-# 本文はクリップボード経由で渡すので、スクリプトに利用者の文字列は入らない
+# 本文はクリップボード経由で渡すので、スクリプトに利用者の文字列は入らない。
+# チャットを開いただけでは入力先が入力欄に移らない（アプリ内ブラウザに残るなど）ので、
+# UI Automation で入力欄（ProseMirror）を探して入力先にしてから貼り付ける。
+# 入力欄が1つに決まらないとき（分割表示など）は、誤送信を避けて exit 3
 PASTE_SCRIPT = (
+    "Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes; "
     "$ws = New-Object -ComObject WScript.Shell; "
     "$p = Get-Process Claude -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; "
     "if (-not $p -or -not $ws.AppActivate($p.Id)) { exit 2 }; "
-    "Start-Sleep -Milliseconds 400; $ws.SendKeys('^v'); Start-Sleep -Milliseconds 400; $ws.SendKeys('{ENTER}')"
+    "$A = [System.Windows.Automation.AutomationElement]; "
+    "$isEdit = New-Object System.Windows.Automation.PropertyCondition($A::ControlTypeProperty, "
+    "[System.Windows.Automation.ControlType]::Edit); "
+    "$eds = @(); "
+    # アプリの画面の読み取りは最初の問い合わせのあとで有効になるので、少し待ちながら数回探す
+    "for ($i = 0; $i -lt 10 -and $eds.Count -eq 0; $i++) { "
+    "$eds = @($A::FromHandle($p.MainWindowHandle).FindAll([System.Windows.Automation.TreeScope]::Descendants, $isEdit) "
+    "| Where-Object { $_.Current.ClassName -match 'ProseMirror' -and -not $_.Current.IsOffscreen }); "
+    "if ($eds.Count -eq 0) { Start-Sleep -Milliseconds 300 } }; "
+    "if ($eds.Count -ne 1) { exit 3 }; "
+    "$eds[0].SetFocus(); "
+    "Start-Sleep -Milliseconds 300; $ws.SendKeys('^v'); Start-Sleep -Milliseconds 400; $ws.SendKeys('{ENTER}')"
 )
+
+
+# Mac 版。AppleScript の中で待ちのループを回すと、自動起動（launchd）から動かしたときに止まることがあったので、
+# 1回で終わる短い問い合わせを Python 側で繰り返す。どの問い合わせにも時間制限をかけ、確かめられなければ送らない
+MAC_FOCUS_INFO = """
+tell application "System Events" to tell process "Claude"
+	set g to value of attribute "AXFocusedUIElement"
+	set r to role of g
+	set c to (value of attribute "AXDOMClassList" of g) as text
+	set e to g
+	repeat 60 times
+		set e to value of attribute "AXParent" of e
+		if role of e is "AXWebArea" then exit repeat
+	end repeat
+	set v to ""
+	try
+		set v to (value of g) as text
+	end try
+	return (frontmost as text) & tab & r & tab & c & tab & ((title of e) as text) & tab & v
+end tell
+"""
+MAC_KEYS = """
+tell application "System Events"
+	if not (frontmost of process "Claude") then return "nofront"
+	keystroke "v" using command down
+	delay 0.4
+	key code 36
+end tell
+return "ok"
+"""
+
+
+def osa(script, *args, timeout=5):
+    """osascript を1回動かして標準出力を返す。失敗や時間切れは None。
+    subprocess.run の時間切れは、止めたあとも出力を待ち続けて戻らないことがあったので、止めたらすぐ戻る"""
+    p = subprocess.Popen(["osascript", "-e", script, *args], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, start_new_session=True)
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(p.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        return None
+    return out.rstrip("\n") if p.returncode == 0 else None
+
+
+def mac_paste_check(title, wait=6):
+    """狙ったチャットの入力欄に入力先があり、書きかけが無ければ None、そうでなければ理由を返す"""
+    if osa('tell application "System Events" to return UI elements enabled') != "true":
+        return "noaccess"
+    # Electron 製のアプリは、補助ツールが使われていると分かるまで画面の情報（入力先など）を出さない
+    osa('tell application "System Events" to tell process "Claude" to set value of attribute "AXManualAccessibility" to true')
+    osa('tell application "Claude" to activate')
+    why = "nofocus"
+    deadline = time.time() + wait  # チャットの切り替えには時間がかかることがあるので、しばらく待つ
+    while time.time() < deadline:
+        info = osa(MAC_FOCUS_INFO)
+        if info:
+            front, role, cls, shown, value = (info.split("\t", 4) + [""] * 5)[:5]
+            if front != "true":
+                why = "nofront"
+            elif role == "AXTextArea" and "ProseMirror" in cls:
+                # 入力欄から親をたどった先の画面の題名（「題名 - Claude Code」）で、どのチャットかを見分ける
+                if shown == f"{title} - Claude Code":
+                    # 空の入力欄でも改行1つが返るので、空白と改行を除いて残る文字があるときだけ書きかけ
+                    return "draft" if value.strip(" \t\r\n\u3000") else None
+                why = "wrongchat"
+        time.sleep(0.3)
+    return why
+
+
+def mac_paste_send(title, check_only=False):
+    why = mac_paste_check(title)
+    if why is None and not check_only:
+        why = None if osa(MAC_KEYS) == "ok" else "nofront"
+    if why == "noaccess":
+        return ("Claude アプリで開きました。キー操作の許可（システム設定 → プライバシーとセキュリティ → "
+                "アクセシビリティ）が無いため、本文はコピーだけしています。⌘V → Return で送信してください")
+    if why:
+        reason = {"nofront": "アプリを前面に出せなかった", "nofocus": "入力欄に入力先が移らなかった",
+                  "draft": "入力欄に書きかけの文字があった",
+                  "wrongchat": "画面に出ているのが別のチャットだった"}.get(why, why)
+        return f"Claude アプリで開きました。{reason}ため、本文はコピーだけしています。⌘V → Return で送信してください"
+    return "確認だけしました（送信していません）" if check_only else "Claude アプリに貼り付けて送信しました"
 
 
 def auto_paste_send(item, text):
@@ -971,14 +1095,45 @@ def auto_paste_send(item, text):
         copy_text(text)
         open_session(item)
         time.sleep(2.5)  # アプリがそのチャットを表示し終えるのを待つ
+        if IS_MAC:
+            title = DESKTOP_TITLES.get(item["id"]) or ""
+            same = [k for k, v in DESKTOP_TITLES.items() if v == title]
+            if not title or len(same) > 1:
+                # 同じ題名のチャットが複数あると、画面の題名で見分けられないので送らない
+                return "Claude アプリで開きました。同じ題名のチャットがあり見分けられないため、本文はコピーだけしています。⌘V → Return で送信してください"
+            return mac_paste_send(title)
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", PASTE_SCRIPT],
                            capture_output=True, timeout=30, **NO_WINDOW)
+    if r.returncode == 3:
+        return "Claude アプリで開きました。入力欄を1つに決められなかったので、本文はコピーだけしています。Ctrl+V → Enter で送信してください"
     if r.returncode != 0:
         raise ValueError("Claude アプリを前面に出せませんでした（画面がロック中かもしれません）")
     return "Claude アプリに貼り付けて送信しました"
 
 
-def run_job(job_id, argv, stdin, cwd, fallback=None):
+def mac_reload_app():
+    """「止めて送る」のあと、Claude アプリの「表示 → 再読み込み」を押して、裏のやりとりを画面に出す。
+    アプリが手前にあるときは、入力中かもしれないので押さない。返り値はカードに添える一言"""
+    if not IS_MAC:
+        return None
+    if osa('tell application "System Events" to return frontmost of process "Claude"') == "true":
+        return "Claude アプリが手前にあったので、画面の再読み込みはしていません。アプリで「表示 → 再読み込み」すると反映されます"
+    for view, reload in (("表示", "再読み込み"), ("View", "Reload")):
+        if osa(f'tell application "System Events" to tell process "Claude" to click menu item "{reload}" of menu "{view}" of menu bar 1'):
+            return "Claude アプリの画面を再読み込みしました（このやりとりもアプリに表示されます）"
+    return "画面の再読み込みができませんでした。アプリで「表示 → 再読み込み」すると反映されます"
+
+
+def mac_after_stop_send(item):
+    notes = [mac_reload_app()]
+    if item.get("bridge_id"):
+        # 止めると Remote Control の接続も切れ、アプリで再開しても自動ではつながり直さない。
+        # 外から付け直す方法（/remote-control の自動入力）は、入力先を安定して確かめられず使えなかった
+        notes.append("このチャットの Remote Control は外れました。必要ならアプリのツールバーでオンにしてください")
+    return "\n".join(n for n in notes if n)
+
+
+def run_job(job_id, argv, stdin, cwd, fallback=None, after=None):
     job = JOBS[job_id]
     if argv[0] in ("claude", "codex", "agy"):
         argv = [cli(argv[0]), *argv[1:]]
@@ -990,6 +1145,10 @@ def run_job(job_id, argv, stdin, cwd, fallback=None):
         )
         job["output"] = (p.stdout or "").strip() or (p.stderr or "").strip()
         job["status"] = "done" if p.returncode == 0 else "error"
+        if job["status"] == "done" and after:
+            note = after()
+            if note:
+                job["output"] += "\n\n" + note
         # Codex アプリで開いているスレッドは CLI から書き込めない。アプリで開いて貼り付けに切り替える
         if p.returncode != 0 and fallback and "active writer" in (p.stderr or "") + (p.stdout or ""):
             job["output"], job["status"] = fallback(), "done"
@@ -1001,6 +1160,7 @@ def run_job(job_id, argv, stdin, cwd, fallback=None):
 
 
 def start_reply(item, text, images=(), stop=False):
+    after = None
     if stop:
         # 「止めて送る」: アプリ側のプロセスを止めて、CLI で同じ会話の続きを送る
         if not item.get("can_stop_send"):
@@ -1008,6 +1168,8 @@ def start_reply(item, text, images=(), stop=False):
         if item.get("host"):
             return start_remote_reply(item, text, images, stop=True)
         stop_idle_session(item["id"])
+        if item["tool"] == "claude" and IS_MAC:
+            after = lambda it=item: mac_after_stop_send(it)  # noqa: E731
         item = {**item, "reply_mode": "cli"}
     elif not item.get("can_reply"):
         raise ValueError(item.get("no_reply") or "このセッションには今は返信できません。アプリで開いて返信してください")
@@ -1037,7 +1199,7 @@ def start_reply(item, text, images=(), stop=False):
     with JOBS_LOCK:
         JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"],
                         "status": "running", "output": "", "started": now()}
-    threading.Thread(target=run_job, args=(job_id, argv, stdin, workdir(item), fallback), daemon=True).start()
+    threading.Thread(target=run_job, args=(job_id, argv, stdin, workdir(item), fallback, after), daemon=True).start()
     return JOBS[job_id]
 
 
