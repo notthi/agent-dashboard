@@ -681,7 +681,7 @@ def snapshot(days, with_remote=True):
 HOSTS_FILE = APP_DIR / "hosts.json"
 SELF_SOURCE = HERE / "server.py"  # exe 化したときも同梱しておけば SSH 先へ送れる
 REMOTE = {}  # name -> {"data", "fetched", "error", "running", "days"}
-REMOTE_TTL = 30
+REMOTE_TTL = 10  # 別マシンから取り直す間隔（秒）。1回 0.5 秒・100KB ほど
 REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";'
 
 
@@ -1218,7 +1218,8 @@ class Handler(BaseHTTPRequestHandler):
         if data.get("tool") == "muse" and path == "/api/open":
             # Muse は会話がローカルに無いので一覧は出せない。アプリを呼び出すだけ
             if not IS_MAC:
-                self.send_json({"error": "Muse アプリは Mac 版のみです"}, 400)
+                open_url("https://muse.ai/")  # アプリは Mac 版のみなので Web 版を開く
+                self.send_json({"ok": True})
                 return
             r = subprocess.run(["open", "-a", "Muse"], capture_output=True, text=True)
             self.send_json({"ok": True} if r.returncode == 0 else {"error": "Muse アプリが見つかりません"},

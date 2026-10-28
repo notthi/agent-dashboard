@@ -181,7 +181,7 @@ const NO_REPLY = {
   codex: "実行中かアーカイブ済みです",
   antigravity: "実行中です",
 };
-// 再描画（10秒ごと）をまたいで残す UI 状態
+// 再描画（5秒ごと）をまたいで残す UI 状態
 const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set() };
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
@@ -384,13 +384,15 @@ function usage(key, t, items) {
   return html + `</div>`;
 }
 // Muse は会話がパソコンに残らないので、一覧ではなくアプリの呼び出し口だけ
+// アプリは Mac 版のみ。Windows ではサーバー側が Web 版を開く（ダッシュボードは localhost で見るので UA で判断できる）
+const IS_WIN_UA = /Windows/.test(navigator.userAgent);
 function museColumn(name, color) {
   return `<section class="col" style="--c:${color}">
     <h2><span class="swatch"></span>${name}</h2>
     <div class="card launcher" data-act="muse">
       <div class="msg" style="margin-left:0">会話は Meta のサーバーにだけあるため、ここには一覧を出せません。</div>
       <div class="actions" style="margin-left:0"><button class="primary" data-act="muse">Muse を開く</button></div>
-      <div class="meta" style="margin-left:0;white-space:normal">画面を左右に並べるには、Muse のウインドウ左上の緑ボタンを長押し →「画面の右半分に配置」</div>
+      <div class="meta" style="margin-left:0;white-space:normal">${IS_WIN_UA ? "Windows ではブラウザで Web 版（muse.ai）を開きます" : "画面を左右に並べるには、Muse のウインドウ左上の緑ボタンを長押し →「画面の右半分に配置」"}</div>
     </div>
   </section>`;
 }
@@ -463,7 +465,7 @@ async function load() {
 $("#days").onchange = () => { try { localStorage.setItem("days", $("#days").value); } catch {} load(); };
 $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#showAuto").checked ? "1" : "0"); } catch {} render(); };
 load();
-setInterval(load, 10000);
+setInterval(load, 5000);
 </script>
 </body>
 </html>
