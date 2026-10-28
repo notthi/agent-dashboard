@@ -1,0 +1,4 @@
+[
+  {"name": "mac-mini", "ssh": "you@mac-mini.local"},
+  {"name": "devbox", "ssh": "devbox"}
+]

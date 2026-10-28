@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Dashboard</title>
+<style>
+:root {
+  --bg: #f6f5f2; --panel: #ffffff; --line: #e4e1da; --text: #1f1e1c; --muted: #77736b;
+  --claude: #c96442; --codex: #3d6fd8; --antigravity: #2f9e74; --muse: #8a5cf6;
+  --busy: #e0a100; --open: #3d9a5c; --done: #b5b0a6;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #161514; --panel: #201f1d; --line: #34322e; --text: #ece9e3; --muted: #9a958b;
+    --claude: #e08463; --codex: #7aa2f2; --antigravity: #5cc79d; --muse: #a98bfa; --done: #5d5a54;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Hiragino Sans", sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
+  padding: 16px 20px; border-bottom: 1px solid var(--line); position: sticky; top: 0;
+  background: var(--bg); z-index: 2; }
+h1 { font-size: 17px; margin: 0; font-weight: 650; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-left: auto; color: var(--muted); font-size: 13px; }
+select, input { font: inherit; }
+select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+#updated { font-variant-numeric: tabular-nums; }
+main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr)); gap: 16px; padding: 16px 20px 40px; }
+@media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px 40px; } header { padding: 12px 16px; } }
+.col { min-width: 0; }
+.col h2 { display: flex; align-items: center; gap: 8px; font-size: 15px; margin: 0 0 10px; }
+.col h2 .swatch { width: 10px; height: 10px; border-radius: 3px; background: var(--c); }
+.col h2 .count { color: var(--muted); font-weight: 400; font-size: 13px; }
+.col h2 .live { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--busy); }
+.section-label { font-size: 12px; color: var(--muted); margin: 14px 0 6px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-left: 3px solid var(--c);
+  border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+.card.done { border-left-color: var(--line); }
+.top { display: flex; gap: 8px; align-items: baseline; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; transform: translateY(-1px); background: var(--done); }
+.busy .dot { background: var(--busy); box-shadow: 0 0 0 3px color-mix(in srgb, var(--busy) 25%, transparent); animation: pulse 1.6s infinite; }
+.open .dot { background: var(--open); }
+@keyframes pulse { 50% { opacity: .45; } }
+.title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.time { color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.meta { color: var(--muted); font-size: 12px; margin: 2px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg { margin: 6px 0 0 16px; font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.msg b { color: var(--muted); font-weight: 500; margin-right: 4px; }
+.msg.full { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; max-height: 420px; overflow: auto;
+  cursor: text; user-select: text; }
+.actions .spacer { flex: 1; }
+.job-wrap { position: relative; }
+.job-wrap .copy { position: absolute; top: 6px; right: 6px; background: var(--panel); }
+.card { transition: border-color .15s, background .15s; }
+.actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 16px; }
+button { font: inherit; font-size: 12px; color: var(--text); background: transparent;
+  border: 1px solid var(--line); border-radius: 6px; padding: 2px 10px; cursor: pointer; white-space: nowrap; flex: none; }
+button:hover:not(:disabled) { border-color: var(--c); color: var(--c); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--c); border-color: var(--c); color: #fff; }
+button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
+.reply-box { margin: 8px 0 0 16px; cursor: default; }
+.reply-box textarea { width: 100%; min-height: 64px; resize: vertical; font: inherit; font-size: 13px;
+  color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+.reply-box textarea:focus { outline: none; border-color: var(--c); }
+.reply-box .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
+.reply-box .hint { color: var(--muted); font-size: 11px; margin-right: auto; }
+.job { margin: 8px 0 0 16px; font-size: 13px; padding: 6px 8px; border-radius: 6px;
+  background: var(--bg); border: 1px dashed var(--line); white-space: pre-wrap; word-break: break-word;
+  max-height: 220px; overflow: auto; cursor: text; }
+.job.running { color: var(--muted); }
+.job.error { color: #c0392b; }
+.toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: var(--text);
+  color: var(--bg); padding: 6px 14px; border-radius: 8px; font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+.toast.show { opacity: .92; }
+.empty { color: var(--muted); font-size: 13px; padding: 8px 2px; }
+.err { color: #c0392b; font-size: 12px; }
+.cols { display: flex; gap: 6px; }
+.chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 999px;
+  padding: 1px 10px 1px 8px; cursor: pointer; user-select: none; font-size: 12px; }
+.chip input { display: none; }
+.chip .sw { width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
+.chip:has(input:not(:checked)) { opacity: .45; }
+.chip:has(input:not(:checked)) .sw { background: var(--line); }
+.usage { color: var(--muted); font-size: 12px; margin: -4px 0 8px; display: flex; flex-direction: column; gap: 4px; }
+.usage b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.limit { display: flex; align-items: center; gap: 6px; }
+.limit .bar { flex: 1; max-width: 140px; height: 5px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.limit .bar i { display: block; height: 100%; background: var(--c); }
+.meta .model { color: var(--text); opacity: .75; }
+.host { display: inline-block; font-size: 11px; line-height: 16px; padding: 0 6px; margin-right: 6px; border-radius: 4px;
+  border: 1px solid var(--line); color: var(--text); }
+#hosts { display: flex; gap: 6px; }
+#hosts .host.err { color: #c0392b; border-color: currentColor; }
+.thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.thumbs div { position: relative; }
+.thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); display: block; }
+.thumbs button { position: absolute; top: -6px; right: -6px; padding: 0 5px; border-radius: 50%; font-size: 11px;
+  background: var(--panel); line-height: 16px; }
+details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin: 10px 0 6px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Dashboard</h1>
+  <div class="controls">
+    <div class="cols" id="cols"></div>
+    <label>期間 <select id="days">
+      <option value="1">24時間</option><option value="3" selected>3日</option>
+      <option value="7">7日</option><option value="30">30日</option>
+    </select></label>
+    <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
+    <span id="hosts"></span>
+    <span id="updated"></span>
+  </div>
+</header>
+<main id="main"></main>
+<div class="toast" id="toast"></div>
+<script>
+const TOOLS = [
+  ["claude", "Claude Code", "var(--claude)"],
+  ["codex", "Codex", "var(--codex)"],
+  ["antigravity", "Antigravity", "var(--antigravity)"],
+  ["muse", "Muse", "var(--muse)"],
+];
+const STATE_LABEL = { busy: "動作中", open: "開いている", done: "", archived: "アーカイブ" };
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+let hiddenCols = new Set();
+try {
+  $("#days").value = localStorage.getItem("days") || "3";
+  $("#showAuto").checked = localStorage.getItem("showAuto") === "1";
+  hiddenCols = new Set(JSON.parse(localStorage.getItem("hiddenCols") || "[]"));
+} catch {}
+$("#cols").innerHTML = TOOLS.map(([k, name, color]) =>
+  `<label class="chip" style="--c:${color}" title="${name} の列を表示/非表示">
+    <input type="checkbox" value="${k}" ${hiddenCols.has(k) ? "" : "checked"}><span class="sw"></span>${name}</label>`).join("");
+$("#cols").onchange = (e) => {
+  e.target.checked ? hiddenCols.delete(e.target.value) : hiddenCols.add(e.target.value);
+  try { localStorage.setItem("hiddenCols", JSON.stringify([...hiddenCols])); } catch {}
+  render();
+};
+
+function fmtTok(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + "B";
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+  if (n >= 1e3) return Math.round(n / 1e3) + "K";
+  return String(n);
+}
+// 入力+出力。キャッシュ読み込みは桁違いに大きく、料金も安いので別表示
+const ioTok = (t) => (t ? t.input + t.output : 0);
+function tokTitle(t) {
+  return t ? `入力 ${t.input.toLocaleString()} / 出力 ${t.output.toLocaleString()} / キャッシュ読込 ${t.cache.toLocaleString()}` : "";
+}
+
+function ago(ts) {
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return "たった今";
+  if (s < 3600) return `${Math.floor(s / 60)}分前`;
+  if (s < 86400) return `${Math.floor(s / 3600)}時間前`;
+  return `${Math.floor(s / 86400)}日前`;
+}
+function project(cwd) {
+  if (!cwd) return "";
+  if (cwd.includes("/scratchpad")) return "scratchpad";
+  return cwd.replace(/\/+$/, "").split("/").slice(-2).join("/");
+}
+const OPEN_LABEL = { claude: "Claude で開く", codex: "Codex で開く", antigravity: "ターミナルで開く" };
+const openLabel = (it) => {
+  if (it.host && it.bridge_id) return "claude.ai で開く";
+  return it.tool === "antigravity" && it.via === "ide" ? "Antigravity を開く" : OPEN_LABEL[it.tool];
+};
+const isPaste = (it) => it.reply_mode === "paste" || it.reply_mode === "bridge";
+// 待機中で開いたままのチャットは「止めて送る」を標準にする（会話は分かれず、トークンもほぼ増えない）
+const stopDefault = (it) => it.can_stop_send && isPaste(it) && !it.auto_paste;
+const NO_REPLY = {
+  claude: "CLI で実行中です",
+  codex: "実行中かアーカイブ済みです",
+  antigravity: "実行中です",
+};
+// 再描画（10秒ごと）をまたいで残す UI 状態
+const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set() };
+// 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
+const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
+
+function msgRow(label, short, fullText, expanded) {
+  if (!short) return "";
+  return expanded && fullText
+    ? `<div class="msg full"><b>${label}</b>${esc(fullText)}</div>`
+    : `<div class="msg"><b>${label}</b>${esc(short)}</div>`;
+}
+async function copyText(text) {
+  try { await navigator.clipboard.writeText(text); return toast("コピーしました"); } catch {}
+  // Clipboard API が使えない環境向けの予備
+  const ta = Object.assign(document.createElement("textarea"), { value: text });
+  ta.style.cssText = "position:fixed;opacity:0";
+  document.body.append(ta);
+  ta.select();
+  const ok = document.execCommand("copy");
+  ta.remove();
+  toast(ok ? "コピーしました" : "コピーできませんでした");
+}
+
+function card(it) {
+  const k = key(it);
+  const st = STATE_LABEL[it.state] ? ` · ${STATE_LABEL[it.state]}` : "";
+  const via = it.via ? ` · ${esc(it.via)}` : "";
+  const open = ui.replyOpen.has(k);
+  const full = ui.expanded.has(k);
+  const job = ui.jobs[k];
+  return `<div class="card ${it.state}" data-key="${esc(k)}">
+    <div class="top"><span class="dot"></span><span class="title">${esc(it.title)}</span>
+      <span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
+    <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}</div>
+    ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
+      ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
+    ${msgRow("指示", it.prompt, it.prompt_full, full)}
+    ${msgRow("応答", it.reply, it.reply_full, full)}
+    <div class="actions">
+      <button data-act="open" ${it.host && !it.bridge_id ? `disabled title="${esc(it.host)} のセッションは、そのマシンで開いてください"` : ""}>${openLabel(it)}</button>
+      <button data-act="toggle" ${it.can_reply ? "" : `disabled title="${esc(it.no_reply || NO_REPLY[it.tool])}"`}>返信</button>
+      <span class="spacer"></span>
+      ${it.prompt_full || it.reply_full ? `<button data-act="expand">${full ? "たたむ" : "全文"}</button>` : ""}
+      ${it.reply ? `<button data-act="copy" title="応答の全文をコピー">応答をコピー</button>` : ""}
+    </div>
+    ${open ? `<div class="reply-box">
+      <textarea placeholder="このチャットに送る内容（画像は貼り付けで添付・⌘+Enter で送信）">${esc(ui.drafts[k] || "")}</textarea>
+      ${(ui.images[k] || []).length ? `<div class="thumbs">${ui.images[k].map((src, i) =>
+        `<div><img src="${src}" alt="添付画像 ${i + 1}"><button data-act="rmimg" data-i="${i}" title="外す">×</button></div>`).join("")}</div>` : ""}
+      <div class="row"><span class="hint">${it.auto_paste
+          ? "アプリでこのチャットを開き、貼り付けて送信します（チャットは止めません）"
+          : stopDefault(it)
+          ? "アプリ側のチャットを止めて裏で送り、返事をここに表示します（アプリには「中断」と出ます。アプリで「表示 → 再読み込み」すると画面にも出ます）"
+          : it.reply_mode === "bridge"
+          ? "claude.ai で開き、本文をコピーします（貼り付けて送信）"
+          : it.reply_mode === "paste"
+          ? "アプリで開き、本文をコピーします（⌘V → Enter で送信）"
+          : "CLI で続きを実行し、返事をここに表示します"}</span>
+        <button data-act="cancel">やめる</button>${stopDefault(it)
+          ? `<button data-act="send" title="アプリ（または claude.ai）で開いて、本文をコピーします">開いてコピー</button><button class="primary" data-act="stopsend">送信</button>`
+          : `<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
+    </div>` : ""}
+    ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? "実行中…" : esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました"))}</div>
+      ${job.status === "done" && job.output ? `<button class="copy" data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}</div>` : ""}
+  </div>`;
+}
+
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toast.timer);
+  toast.timer = setTimeout(() => t.classList.remove("show"), 2200);
+}
+async function post(path, body) {
+  const r = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "X-Agent-Dashboard": "1" },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+  return data;
+}
+function findItem(k) {
+  const tool = k.split(":")[0];
+  return (last?.tools[tool]?.items || []).find((i) => key(i) === k);
+}
+async function openItem(it) {
+  try { await post("/api/open", { tool: it.tool, id: it.id, host: it.host }); toast(`「${it.title}」を開きました`); }
+  catch (e) { toast(e.message); }
+}
+async function sendReply(it, k, stop = false) {
+  const text = (ui.drafts[k] || "").trim();
+  const images = ui.images[k] || [];
+  if (!text && !images.length) return;
+  try {
+    const job = await post("/api/reply", { tool: it.tool, id: it.id, host: it.host, text, images, stop });
+    ui.jobs[k] = job;
+    ui.drafts[k] = "";
+    ui.images[k] = [];
+    ui.replyOpen.delete(k);
+    render();
+    pollJob(k, job.id);
+  } catch (e) { toast(e.message); }
+}
+async function pollJob(k, id) {
+  while (true) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const job = await fetch(`/api/job?id=${id}`).then((r) => r.json()).catch(() => null);
+    if (!job || job.error) return;
+    ui.jobs[k] = job;
+    if (job.status !== "running") { render(); load(); return; }
+  }
+}
+
+document.addEventListener("click", (e) => {
+  const cardEl = e.target.closest(".card[data-key]");
+  // 全文や返事の欄は文字を選べるよう、クリックでアプリを開かない
+  if (!cardEl || (e.target.closest(".reply-box, .job, .msg.full") && !e.target.closest("button"))) return;
+  const k = cardEl.dataset.key, it = findItem(k);
+  if (!it) return;
+  const act = e.target.closest("button")?.dataset.act;
+  if (act === "expand") {
+    ui.expanded.has(k) ? ui.expanded.delete(k) : ui.expanded.add(k);
+    render();
+  } else if (act === "copy") {
+    copyText(it.reply_full || it.reply);
+  } else if (act === "copyjob") {
+    copyText(ui.jobs[k]?.output || "");
+  } else if (act === "toggle") {
+    ui.replyOpen.has(k) ? ui.replyOpen.delete(k) : ui.replyOpen.add(k);
+    render();
+    document.querySelector(`.card[data-key="${CSS.escape(k)}"] textarea`)?.focus();
+  } else if (act === "open") {
+    // 誤タップで移動しないよう、アプリへ移るのは「〜で開く」ボタンのときだけ
+    openItem(it);
+  }
+});
+document.addEventListener("click", (e) => {
+  const btn = e.target.closest(".reply-box button");
+  if (!btn) return;
+  const k = btn.closest(".card").dataset.key;
+  if (btn.dataset.act === "cancel") { ui.replyOpen.delete(k); render(); }
+  if (btn.dataset.act === "send") sendReply(findItem(k), k);
+  if (btn.dataset.act === "stopsend") sendReply(findItem(k), k, true);
+  if (btn.dataset.act === "rmimg") { ui.images[k].splice(+btn.dataset.i, 1); render(); }
+});
+// 入力欄に画像を貼り付けると添付になる
+document.addEventListener("paste", (e) => {
+  const ta = e.target.closest?.(".reply-box textarea");
+  if (!ta) return;
+  const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
+  if (!files.length) return;
+  e.preventDefault();
+  const k = ta.closest(".card").dataset.key;
+  ui.images[k] ||= [];
+  files.forEach((f) => {
+    if (ui.images[k].length >= 5) return toast("画像は5枚までです");
+    if (f.size > 10 * 1024 * 1024) return toast("画像は1枚 10MB までです");
+    const r = new FileReader();
+    r.onload = () => {
+      ui.images[k].push(r.result);
+      render();
+      const el = document.querySelector(`.card[data-key="${CSS.escape(k)}"] textarea`);
+      if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+    };
+    r.readAsDataURL(f);
+  });
+});
+document.addEventListener("input", (e) => {
+  if (e.target.matches(".reply-box textarea")) ui.drafts[e.target.closest(".card").dataset.key] = e.target.value;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.target.matches(".reply-box textarea") && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    const k = e.target.closest(".card").dataset.key, it = findItem(k);
+    sendReply(it, k, stopDefault(it));
+  }
+});
+const DAYS_LABEL = { 1: "24時間", 3: "3日", 7: "7日", 30: "30日" };
+function limitRow(label, l) {
+  if (!l) return "";
+  const reset = l.resets_at * 1000;
+  // リセット時刻を過ぎた記録は古いので 0% とみなす
+  const pct = reset < Date.now() ? 0 : l.used_percent;
+  const when = reset < Date.now() ? "リセット済み" : `${new Date(reset).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} にリセット`;
+  return `<div class="limit">${label}<span class="bar"><i style="width:${Math.min(100, pct)}%"></i></span><b>${pct}%</b><span>${when}</span></div>`;
+}
+function usage(key, t, items) {
+  if (key === "antigravity") {
+    // トークン数は読めないが、使用制限は agy の /usage から取れる
+    if (!t.quota) return `<div class="usage">使用制限を取得中…（トークン数はデータから読み取れません）</div>`;
+    const name = (q) => `${q.group.replace(" models", "").replace("Models", "")} ${/Five Hour/i.test(q.label) ? "5時間" : /Weekly/i.test(q.label) ? "週" : q.label}`;
+    return `<div class="usage">${t.quota.map((q) => limitRow(esc(name(q)), q)).join("")}</div>`;
+  }
+  const sum = { input: 0, output: 0, cache: 0 };
+  items.forEach((i) => i.tokens && ["input", "output", "cache"].forEach((f) => (sum[f] += i.tokens[f])));
+  let html = `<div class="usage"><div title="${tokTitle(sum)}">${DAYS_LABEL[$("#days").value] || ""}の入出力 <b>${fmtTok(ioTok(sum))}</b> tokens（キャッシュ読込 ${fmtTok(sum.cache)}）</div>`;
+  if (t.limits) html += limitRow("5時間枠", t.limits.primary) + limitRow("週の枠", t.limits.secondary);
+  else if (key === "claude") html += `<div>5時間枠・週の枠は、statusline.py を登録すると表示されます</div>`;
+  return html + `</div>`;
+}
+// Muse は会話がパソコンに残らないので、一覧ではなくアプリの呼び出し口だけ
+function museColumn(name, color) {
+  return `<section class="col" style="--c:${color}">
+    <h2><span class="swatch"></span>${name}</h2>
+    <div class="card launcher" data-act="muse">
+      <div class="msg" style="margin-left:0">会話は Meta のサーバーにだけあるため、ここには一覧を出せません。</div>
+      <div class="actions" style="margin-left:0"><button class="primary" data-act="muse">Muse を開く</button></div>
+      <div class="meta" style="margin-left:0;white-space:normal">画面を左右に並べるには、Muse のウインドウ左上の緑ボタンを長押し →「画面の右半分に配置」</div>
+    </div>
+  </section>`;
+}
+document.addEventListener("click", async (e) => {
+  if (!e.target.closest('[data-act="muse"]')) return;
+  try { await post("/api/open", { tool: "muse" }); toast("Muse を開きました"); }
+  catch (err) { toast(err.message); }
+});
+function column([key, name, color], data) {
+  if (key === "muse") return museColumn(name, color);
+  const t = data.tools[key] || { items: [] };
+  const showAuto = $("#showAuto").checked;
+  const all = t.items;
+  const items = all.filter((i) => showAuto || !i.auto);
+  const hidden = all.length - items.length;
+  const active = items.filter((i) => i.state === "busy" || i.state === "open");
+  const rest = items.filter((i) => !active.includes(i));
+  const busy = items.filter((i) => i.state === "busy").length;
+  let html = `<section class="col" style="--c:${color}">
+    <h2><span class="swatch"></span>${name}<span class="count">${items.length}件</span>
+    ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}</h2>` + usage(key, t, items);
+  if (t.error) html += `<div class="err">読み込みエラー: ${esc(t.error)}</div>`;
+  if (active.length) html += `<div class="section-label">いま</div>` + active.map(card).join("");
+  if (rest.length) {
+    const head = rest.slice(0, 15), tail = rest.slice(15);
+    html += `<div class="section-label">最近</div>` + head.map(card).join("");
+    if (tail.length) html += `<details><summary>さらに ${tail.length} 件</summary>${tail.map(card).join("")}</details>`;
+  }
+  if (!items.length) html += `<div class="empty">この期間のセッションはありません</div>`;
+  if (hidden) html += `<div class="empty">自動実行 ${hidden} 件を非表示</div>`;
+  return html + `</section>`;
+}
+
+let last = null;
+function render() {
+  if (!last) return;
+  const open = [...document.querySelectorAll("details")].map((d) => d.open);
+  // 全文や返事の欄のスクロール位置を描き直しのあとも保つ
+  const scrolls = [...document.querySelectorAll(".msg.full, .job")].map((el) =>
+    [el.closest(".card")?.dataset.key, el.className, el.scrollTop]);
+  const shown = TOOLS.filter(([k]) => !hiddenCols.has(k));
+  $("#main").style.setProperty("--n", Math.max(1, shown.length));
+  $("#main").innerHTML = shown.length
+    ? shown.map((t) => column(t, last)).join("")
+    : `<div class="empty">表示する列がありません。右上で選んでください</div>`;
+  document.querySelectorAll("details").forEach((d, i) => (d.open = !!open[i]));
+  scrolls.forEach(([k, cls, top]) => {
+    const el = k && document.querySelector(`.card[data-key="${CSS.escape(k)}"] .${cls.trim().split(/\s+/).join(".")}`);
+    if (el) el.scrollTop = top;
+  });
+  $("#updated").textContent = "更新 " + new Date(last.generated * 1000).toLocaleTimeString();
+  // hosts.json に書いたマシンごとの接続状態
+  $("#hosts").innerHTML = (last.hosts || []).map((h) => {
+    const label = h.error ? "接続できません" : h.loading ? "読み込み中" : `${ago(h.fetched)}に取得`;
+    return `<span class="host ${h.error ? "err" : ""}" title="${esc(h.error || label)}">${esc(h.name)}${h.error ? " ✕" : h.loading ? " …" : ""}</span>`;
+  }).join("");
+}
+async function load() {
+  try {
+    const r = await fetch(`/api/sessions?days=${$("#days").value}`);
+    last = await r.json();
+    // 入力中に描き直すとカーソルが飛ぶので、入力欄にフォーカスがある間は保留
+    // 文字を選んでいる間も、選択が消えないよう保留
+    const selecting = String(window.getSelection?.() || "").length > 0;
+    if (!document.activeElement?.matches(".reply-box textarea") && !selecting) render();
+  } catch (e) {
+    $("#updated").textContent = "サーバーに接続できません";
+  }
+}
+$("#days").onchange = () => { try { localStorage.setItem("days", $("#days").value); } catch {} load(); };
+$("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#showAuto").checked ? "1" : "0"); } catch {} render(); };
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

@@ -1,0 +1,1297 @@
+#!/usr/bin/env python3
+"""Claude / Codex / Antigravity のセッションを一覧するローカルダッシュボード。
+
+一覧は各ツールがローカルに残している履歴を読むだけ。
+カードから各アプリの該当チャットを開いたり、CLI 経由で返信したりできる。
+  python3 server.py            -> http://localhost:8765
+  python3 server.py --share    -> 上に加え、Tailscale の自分の端末にだけこのマシンの一覧を見せる
+  python server.py --install   -> Windows: ログイン時に --share 付きで自動起動するよう登録
+"""
+import base64
+import errno
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import signal
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import uuid
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+IS_WIN = sys.platform == "win32"
+IS_MAC = sys.platform == "darwin"
+HOME = Path.home()
+CLAUDE_DIR = HOME / ".claude"
+CODEX_DIR = HOME / ".codex"
+AGY_DIR = HOME / ".gemini" / "antigravity"
+FROZEN = getattr(sys, "frozen", False)  # PyInstaller で exe 化したとき
+HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))  # 同梱した index.html の場所
+APP_DIR = Path(sys.executable).parent if FROZEN else Path(__file__).resolve().parent  # hosts.json を置く場所
+PORT = int(os.environ.get("PORT", "8765"))
+# pythonw から CLI などを起動すると空の黒いウインドウが出るので、出さないようにする
+NO_WINDOW = {"creationflags": subprocess.CREATE_NO_WINDOW} if IS_WIN else {}
+
+if IS_MAC:
+    CACHE_DIR = HOME / "Library/Caches/agent-dashboard"
+    CLAUDE_APP_DIR = HOME / "Library/Application Support/Claude"
+elif IS_WIN:
+    CACHE_DIR = Path(os.environ.get("LOCALAPPDATA", HOME / "AppData/Local")) / "agent-dashboard"
+    CLAUDE_APP_DIR = Path(os.environ.get("APPDATA", HOME / "AppData/Roaming")) / "Claude"
+else:
+    CACHE_DIR = HOME / ".cache/agent-dashboard"
+    CLAUDE_APP_DIR = HOME / ".config/Claude"
+
+# アプリ経由や自動起動ではシェルの PATH を引き継がないことがあるので CLI の置き場所を足す
+_EXTRA_PATH = [HOME / ".local/bin"]
+if IS_WIN:
+    _EXTRA_PATH += [Path(os.environ.get("APPDATA", "")) / "npm", HOME / ".bun/bin",
+                    Path(os.environ.get("LOCALAPPDATA", "")) / "Programs/agy"]
+else:
+    _EXTRA_PATH += [Path("/opt/homebrew/bin"), Path("/usr/local/bin")]
+CLI_PATH = os.pathsep.join([*map(str, _EXTRA_PATH), os.environ.get("PATH", "")])
+CLI_ENV = {**os.environ, "PATH": CLI_PATH, "NO_COLOR": "1"}
+
+
+def cli(name):
+    """CLI のフルパス。Windows の npm 製 CLI は .cmd なので名前だけでは起動できない"""
+    return shutil.which(name, path=CLI_PATH) or name
+
+
+def open_url(url):
+    if IS_WIN:
+        os.startfile(url)  # noqa: S606  既定のアプリでカスタム URL を開く
+    else:
+        subprocess.run(["open" if IS_MAC else "xdg-open", url], check=True)
+
+
+def copy_text(text):
+    if IS_WIN:
+        # clip.exe は BOM 付き UTF-16 なら日本語も通る
+        subprocess.run(["clip"], input=text.encode("utf-16"), check=True, **NO_WINDOW)
+    elif IS_MAC:
+        # LANG が無いと pbcopy が UTF-8 として扱わず日本語が化ける
+        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True,
+                       env={**os.environ, "LANG": "en_US.UTF-8", "LC_CTYPE": "UTF-8"})
+    else:
+        subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode("utf-8"), check=True)
+
+ACTIVE_WINDOW = 120  # 秒。これ以内に更新があれば「動作中」とみなす
+TAIL_BYTES = 400_000
+
+
+def now():
+    return time.time()
+
+
+def tail_lines(path, nbytes=TAIL_BYTES):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - nbytes))
+            data = f.read()
+    except OSError:
+        return []
+    lines = data.split(b"\n")
+    if size > nbytes:
+        lines = lines[1:]  # 途中から始まる行は捨てる
+    out = []
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            out.append(json.loads(raw))
+        except ValueError:
+            pass
+    return out
+
+
+def clip(text, n=240):
+    text = " ".join((text or "").split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+FULL_MAX = 50_000
+
+
+def full_text(text):
+    """短縮表示と違うときだけ全文（改行は残す）を返す。カードの「全文」用"""
+    text = (text or "").strip()
+    if not text or clip(text) == " ".join(text.split()):
+        return None
+    return text[:FULL_MAX]
+
+
+def ro_connect(path):
+    # as_uri() で Windows のドライブ文字や空白も正しく URI になる
+    return sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=2)
+
+
+def pid_alive(pid):
+    if not pid:
+        return False
+    if IS_WIN:
+        # Windows の os.kill(pid, 0) は確認ではなくプロセスを終了させてしまうので使わない
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x1000, False, int(pid))  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        code = ctypes.c_ulong()
+        ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+        k32.CloseHandle(h)
+        return bool(ok) and code.value == 259  # STILL_ACTIVE
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+# ---------------------------------------------------------------- Claude
+
+def claude_text(content):
+    if isinstance(content, str):
+        return content
+    parts = []
+    for c in content or []:
+        if isinstance(c, dict) and c.get("type") == "text":
+            parts.append(c.get("text", ""))
+    return "\n".join(parts)
+
+
+def stop_idle_session(sid):
+    """アプリが開いたまま待機しているセッションのプロセスを止める。処理中なら止めない"""
+    lv = claude_live().get(sid)
+    if lv is None:
+        return  # もう止まっている
+    if lv.get("status") != "idle":
+        raise ValueError("このチャットは処理中です。終わってから送ってください")
+    pid = int(lv["pid"])
+    if IS_WIN:
+        # 子プロセス（MCP サーバーなど）ごと止める
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, **NO_WINDOW)
+    else:
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not pid_alive(pid):
+            return
+        time.sleep(0.1)
+    raise ValueError("アプリ側のセッションを止められませんでした")
+
+
+def claude_live():
+    """~/.claude/sessions/<pid>.json = 起動中のプロセス"""
+    live = {}
+    for f in (CLAUDE_DIR / "sessions").glob("*.json"):
+        try:
+            d = json.loads(f.read_bytes())  # bytes なら Windows でも UTF-8 として読まれる
+        except (OSError, ValueError):
+            continue
+        if not pid_alive(d.get("pid", 0)):
+            continue
+        live[d.get("sessionId")] = d
+    return live
+
+
+_USAGE_CACHE = {}  # path -> ((size, mtime), 結果)。履歴は追記だけなので変わったものだけ読み直す
+
+
+def cached_by_stat(path, fn):
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (st.st_size, st.st_mtime)
+    hit = _USAGE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    val = fn(path)
+    _USAGE_CACHE[path] = (key, val)
+    return val
+
+
+def iso_ts(s):
+    try:
+        return datetime.fromisoformat((s or "").replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return 0
+
+
+def add_tokens(days, ts, inp, out, cache):
+    """日付(ローカル)ごとに積む。期間で絞るときは日単位"""
+    day = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    t = days.setdefault(day, {"input": 0, "output": 0, "cache": 0})
+    t["input"] += inp
+    t["output"] += out
+    t["cache"] += cache
+
+
+def tokens_since(days, since):
+    first = datetime.fromtimestamp(since).strftime("%Y-%m-%d")
+    tot = {"input": 0, "output": 0, "cache": 0}
+    for day, t in (days or {}).items():
+        if day >= first:
+            for k in tot:
+                tot[k] += t[k]
+    return tot
+
+
+def claude_usage(path):
+    """日ごとのトークン数と最後に使ったモデル。同じ応答が複数行に分かれるので message.id で重複を除く"""
+    seen = {}
+    model = None
+    with open(path, "rb") as f:
+        for raw in f:
+            if b'"usage"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            m = d.get("message") or {}
+            u = m.get("usage")
+            if d.get("type") != "assistant" or not u:
+                continue
+            if m.get("model") and not m["model"].startswith("<"):
+                model = m["model"]
+            seen[m.get("id") or d.get("uuid")] = (iso_ts(d.get("timestamp")), u)
+    days = {}
+    for ts, u in seen.values():
+        add_tokens(days, ts,
+                   (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0),
+                   u.get("output_tokens") or 0,
+                   u.get("cache_read_input_tokens") or 0)
+    return {"model": model, "days": days}
+
+
+def codex_usage(path):
+    """rollout の token_count から日ごとのトークン数と、最新の使用制限(5時間/週)を取る"""
+    days, limits = {}, None
+    with open(path, "rb") as f:
+        for raw in f:
+            if b'"token_count"' not in raw:
+                continue
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                continue
+            p = d.get("payload") or {}
+            ts = iso_ts(d.get("timestamp"))
+            u = (p.get("info") or {}).get("last_token_usage")
+            if u:
+                cached = u.get("cached_input_tokens") or 0
+                add_tokens(days, ts, (u.get("input_tokens") or 0) - cached,
+                           u.get("output_tokens") or 0, cached)
+            rl = p.get("rate_limits")
+            if rl and rl.get("primary"):
+                limits = {"ts": ts, "primary": rl.get("primary"), "secondary": rl.get("secondary")}
+    return {"days": days, "limits": limits}
+
+
+DESKTOP_SESSIONS = CLAUDE_APP_DIR / "claude-code-sessions"
+
+
+def claude_desktop_ids():
+    """CLI のセッション ID -> デスクトップアプリ側の ID (local_…)。両者は一致しないことがある"""
+    ids = {}
+    for f in DESKTOP_SESSIONS.glob("*/*/local_*.json"):
+        try:
+            d = json.loads(f.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if d.get("cliSessionId") and not d.get("isArchived"):
+            ids[d["cliSessionId"]] = d.get("sessionId") or f.stem
+    return ids
+
+
+def collect_claude(since):
+    live = claude_live()
+    desktop = claude_desktop_ids()
+    items = {}
+    for f in (CLAUDE_DIR / "projects").glob("*/*.jsonl"):
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        sid = f.stem
+        if mtime < since and sid not in live:
+            continue
+        title = prompt = reply = cwd = entry = None
+        sidechain_only = True
+        turn_done = False  # 最後の発言が「応答し終えた」アシスタントか
+        for d in tail_lines(f):
+            t = d.get("type")
+            entry = d.get("entrypoint") or entry
+            if t in ("user", "assistant") and not d.get("isSidechain"):
+                turn_done = t == "assistant" and (d.get("message") or {}).get("stop_reason") in (
+                    "end_turn", "stop_sequence", "max_tokens", "refusal")
+            if t == "custom-title":
+                title = d.get("customTitle") or title
+            elif t == "agent-name":
+                title = title or d.get("agentName")
+            elif t == "last-prompt":
+                prompt = d.get("lastPrompt") or prompt
+            elif t == "user":
+                cwd = d.get("cwd") or cwd
+                if not d.get("isSidechain"):
+                    sidechain_only = False
+                    txt = claude_text(d.get("message", {}).get("content"))
+                    if txt and not txt.lstrip().startswith("<"):
+                        prompt = txt
+            elif t == "assistant" and not d.get("isSidechain"):
+                txt = claude_text(d.get("message", {}).get("content"))
+                if txt.strip():
+                    reply = txt
+        lv = live.get(sid)
+        if lv:
+            cwd = lv.get("cwd") or cwd
+            title = lv.get("name") or title
+            state = "busy" if lv.get("status") == "busy" else "open"
+            updated = max(mtime, (lv.get("updatedAt") or 0) / 1000)
+        else:
+            # 最近書かれていても、応答し終えていれば待機中。ダッシュボードから送信中のものは処理中
+            sending = any(j["session"] == sid and j["status"] == "running" for j in list(JOBS.values()))
+            state = "busy" if sending or (now() - mtime < ACTIVE_WINDOW and not turn_done) else "done"
+            updated = mtime
+        if cwd is None:
+            cwd = "/" + f.parent.name.lstrip("-").replace("-", "/")
+        usage = cached_by_stat(str(f), claude_usage) or {}
+        items[sid] = {
+            "model": usage.get("model"),
+            "tokens": tokens_since(usage.get("days"), since),
+            "tool": "claude",
+            "id": sid,
+            "title": title or clip(prompt, 60) or "(無題)",
+            "cwd": cwd,
+            "updated": updated,
+            "state": state,
+            "prompt": clip(prompt),
+            "reply": clip(reply),
+            "prompt_full": full_text(prompt),
+            "reply_full": full_text(reply),
+            "auto": bool(lv is None and sidechain_only),
+            "via": (lv or {}).get("entrypoint") or entry or "",
+            "live": lv is not None,
+            "desktop_id": (lv or {}).get("hostSessionId") or desktop.get(sid),
+            # Remote Control で claude.ai からも操作できるセッションの ID（別マシンから開く・返信するのに使う）
+            "bridge_id": (lv or {}).get("bridgeSessionId"),
+            # 開いているセッションへ CLI から書き込むと履歴が分岐するので、
+            # その場合はアプリで開いて本文をクリップボードに入れるだけにする
+            "reply_mode": "paste" if lv else "cli",
+            "can_reply": lv is not None or state != "busy",
+            # 待機中ならアプリ側のプロセスを止めてから CLI で送れる（会話は1本のまま。アプリには「中断」と出る）
+            "can_stop_send": lv is not None and state == "open",
+            # Windows ではアプリでそのチャットを開き、貼り付けて Enter まで自動で押せる（止めずに同じ会話へ届く）
+            "auto_paste": IS_WIN and lv is not None and bool((lv or {}).get("hostSessionId") or desktop.get(sid)),
+        }
+    return sorted(items.values(), key=lambda x: -x["updated"])
+
+
+# ---------------------------------------------------------------- Codex
+
+def codex_rollout(path):
+    prompt = reply = None
+    running = False
+    for d in tail_lines(path):
+        p = d.get("payload") or {}
+        pt = p.get("type")
+        if d.get("type") == "event_msg":
+            if pt == "task_started":
+                running = True
+            elif pt in ("task_complete", "turn_aborted"):
+                running = False
+            elif pt == "user_message":
+                prompt = p.get("message") or prompt
+            elif pt == "agent_message":
+                reply = p.get("message") or reply
+        elif d.get("type") == "response_item" and pt == "message":
+            txt = "\n".join(
+                c.get("text", "") for c in p.get("content") or [] if isinstance(c, dict)
+            )
+            if not txt.strip() or txt.lstrip().startswith("<"):
+                continue
+            if p.get("role") == "user":
+                prompt = txt
+            elif p.get("role") == "assistant":
+                reply = txt
+    return prompt, reply, running
+
+
+def collect_codex(since):
+    db = CODEX_DIR / "state_5.sqlite"
+    if not db.exists():
+        return []
+    con = ro_connect(db)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """select id, rollout_path, coalesce(updated_at_ms, updated_at*1000) as upd,
+                  source, cwd, title, name, preview, model, reasoning_effort, tokens_used,
+                  agent_nickname, archived
+           from threads where coalesce(updated_at_ms, updated_at*1000) >= ?
+           order by upd desc limit 200""",
+        (since * 1000,),
+    ).fetchall()
+    con.close()
+    items = []
+    for r in rows:
+        updated = r["upd"] / 1000
+        prompt, reply, running = codex_rollout(r["rollout_path"])
+        usage = cached_by_stat(r["rollout_path"], codex_usage) or {}
+        try:
+            updated = max(updated, os.stat(r["rollout_path"]).st_mtime)
+        except OSError:
+            pass
+        src = r["source"] or ""
+        auto = src == "exec" or src.startswith("{")
+        # rollout に開始/完了の記録があるのでそれで判定（完了記録が無いまま放置されたものは除外）
+        state = "busy" if running and now() - updated < 30 * 60 else "done"
+        title = r["name"] or r["title"] or r["preview"]
+        if r["agent_nickname"]:
+            title = f"[{r['agent_nickname']}] {title}"
+        items.append({
+            "tool": "codex",
+            "id": r["id"],
+            "title": clip(title, 80),
+            "cwd": r["cwd"],
+            "updated": updated,
+            "state": "archived" if r["archived"] else state,
+            "prompt": clip(prompt or r["preview"]),
+            "reply": clip(reply),
+            "prompt_full": full_text(prompt or r["preview"]),
+            "reply_full": full_text(reply),
+            "auto": auto,
+            "via": src if not src.startswith("{") else "subagent",
+            "model": " ".join(x for x in (r["model"], r["reasoning_effort"]) if x) or None,
+            "tokens": tokens_since(usage.get("days"), since),
+            "limits": usage.get("limits"),
+            "can_reply": not r["archived"] and state != "busy",
+        })
+    return items
+
+
+# ---------------------------------------------------------------- Antigravity
+
+def parse_ts(s):
+    s = (s or "").strip()
+    if not s:
+        return 0
+    s = s.replace(" ", "T", 1)
+    # 小数秒が6桁を超えると fromisoformat が失敗する環境がある
+    if "." in s:
+        head, rest = s.split(".", 1)
+        frac = "".join(ch for ch in rest if ch.isdigit())[:6]
+        tz = rest[len("".join(ch for ch in rest if ch.isdigit())):]
+        s = f"{head}.{frac}{tz}"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return 0
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+AGY_CONV_DIRS = [AGY_DIR / "conversations", HOME / ".gemini" / "antigravity-cli" / "conversations"]
+# パス中の "claude-501" などを拾わないよう、モデル名らしい形に限る
+AGY_MODEL_RE = re.compile(rb"\b(?:gemini-\d[a-z0-9.\-]*|claude-(?:opus|sonnet|haiku|fable)[a-z0-9.\-]*|gpt-\d[a-z0-9.\-]*)")
+
+
+def agy_model(path):
+    """会話 DB の最新の生成メタデータからモデル名を拾う（中身は protobuf なので文字列だけ見る）"""
+    try:
+        con = ro_connect(path)
+        row = con.execute("select data from gen_metadata order by idx desc limit 1").fetchone()
+        con.close()
+    except sqlite3.Error:
+        return None
+    m = AGY_MODEL_RE.search(row[0] or b"") if row else None
+    return m.group(0).decode() if m else None
+
+
+def agy_conversation_db(cid):
+    for d in AGY_CONV_DIRS:
+        p = d / f"{cid}.db"
+        if p.exists():
+            return str(p)
+    return None
+
+
+def collect_antigravity(since):
+    db = AGY_DIR / "conversation_summaries.db"
+    if not db.exists():
+        return []
+    con = ro_connect(db)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        """select conversation_id, title, preview, step_count, last_modified_time,
+                  workspace_uris, status, source, agent_name, not_fully_idle, killed,
+                  parent_conversation_id
+           from conversation_summaries order by last_modified_time desc"""
+    ).fetchall()
+    con.close()
+    items = []
+    for r in rows:
+        updated = parse_ts(r["last_modified_time"])
+        status = r["status"] or ""
+        running = "RUNNING" in status or bool(r["not_fully_idle"])
+        if updated < since and not running:
+            continue
+        try:
+            ws = json.loads(r["workspace_uris"] or "[]")
+        except ValueError:
+            ws = []
+        cwd = ws[0].replace("file://", "") if ws else ""
+        if r["killed"]:
+            state = "done"
+        elif running:
+            state = "busy"
+        else:
+            state = "done"
+        src = (r["source"] or "").replace("CORTEX_TRAJECTORY_SOURCE_", "").lower()
+        items.append({
+            "tool": "antigravity",
+            "id": r["conversation_id"],
+            "title": clip(r["title"] or r["preview"] or "(無題)", 80),
+            "cwd": cwd,
+            "updated": updated,
+            "state": state,
+            "prompt": clip(r["preview"]),
+            "reply": "",
+            "prompt_full": full_text(r["preview"]),
+            "auto": src == "cli" or bool(r["parent_conversation_id"]) or "/scratchpad/" in cwd,
+            "via": src or "ide",
+            "steps": r["step_count"],
+            "model": cached_by_stat(dbp, agy_model) if (dbp := agy_conversation_db(r["conversation_id"])) else None,
+            "tokens": None,  # 使用量は protobuf の中で読めない
+            # アプリ(IDE)で作った会話は agy から見えず "trajectory not found" になる
+            "can_reply": bool(src) and not running,
+            "no_reply": "アプリで作った会話はここから返信できません" if not src else None,
+        })
+    return items
+
+
+# `agy -p /usage` は 10 秒近くかかるので裏で定期的に取って使い回す（モデルは呼ばないので枠は減らない）
+AGY_QUOTA = {"rows": None, "fetched": 0, "running": False}
+AGY_QUOTA_TTL = 5 * 60
+
+
+def refresh_agy_quota():
+    try:
+        p = subprocess.run([cli("agy"), "-p", "/usage"], capture_output=True, text=True, timeout=60,
+                           encoding="utf-8", errors="replace", cwd=str(HOME), env=CLI_ENV, **NO_WINDOW)
+        rows = []
+        for line in p.stdout.splitlines():
+            cols = line.split("\t")
+            if len(cols) == 4 and cols[2].rstrip("%").isdigit():
+                rows.append({"group": cols[0], "label": cols[1],
+                             "used_percent": 100 - int(cols[2].rstrip("%")), "resets_at": iso_ts(cols[3])})
+        if rows:
+            AGY_QUOTA["rows"] = rows
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        AGY_QUOTA["fetched"] = now()
+        AGY_QUOTA["running"] = False
+
+
+def agy_quota():
+    if not AGY_QUOTA["running"] and now() - AGY_QUOTA["fetched"] > AGY_QUOTA_TTL:
+        AGY_QUOTA["running"] = True
+        threading.Thread(target=refresh_agy_quota, daemon=True).start()
+    return AGY_QUOTA["rows"]
+
+
+CLAUDE_LIMITS = CACHE_DIR / "claude_rate_limits.json"
+
+
+def claude_limits():
+    """statusline.py が書き残した rate_limits を Codex と同じ形にそろえる"""
+    try:
+        d = json.loads(CLAUDE_LIMITS.read_bytes())
+    except (OSError, ValueError):
+        return None
+    rl = d.get("rate_limits") or {}
+
+    def win(w):
+        if not w or w.get("used_percentage") is None:
+            return None
+        reset = w.get("resets_at") or 0
+        if isinstance(reset, str):
+            reset = iso_ts(reset)
+        elif reset > 1e12:  # ミリ秒で来た場合
+            reset /= 1000
+        return {"used_percent": round(w["used_percentage"]), "resets_at": reset}
+
+    out = {"ts": d.get("ts"), "primary": win(rl.get("five_hour")), "secondary": win(rl.get("seven_day"))}
+    return out if out["primary"] or out["secondary"] else None
+
+
+COLLECTORS = {
+    "claude": collect_claude,
+    "codex": collect_codex,
+    "antigravity": collect_antigravity,
+}
+
+
+INDEX = {}  # (tool, id, host) -> 直近の一覧に出た item。開く・返信の対象はここにあるものだけ
+
+
+def snapshot(days, with_remote=True):
+    since = now() - days * 86400
+    out = {"generated": now(), "days": days, "tools": {}}
+    for name, fn in COLLECTORS.items():
+        try:
+            items = fn(since)
+            out["tools"][name] = {"items": items}
+            # 使用制限はアカウント全体の値なので、いちばん新しい記録を採る
+            limits = [i.pop("limits") for i in items if i.get("limits")]
+            if name == "claude":
+                limits = [x for x in [claude_limits()] if x]
+            if name == "antigravity" and with_remote:
+                out["tools"][name]["quota"] = agy_quota()
+            if limits:
+                out["tools"][name]["limits"] = max(limits, key=lambda x: x["ts"])
+            INDEX.update(((name, i["id"], None), i) for i in items)
+        except Exception as e:  # 1つ壊れても他は表示する
+            out["tools"][name] = {"items": [], "error": f"{type(e).__name__}: {e}"}
+    if with_remote:
+        merge_remote(out, days)
+    return out
+
+
+# ---------------------------------------------------------------- リモート (SSH)
+# hosts.json に書いたマシンへ SSH でつなぎ、このファイル自体を送って --dump させる。
+# 相手側に何も置かなくてよい。鍵認証で、パスワードを聞かれずにつながる必要がある。
+#   [{"name": "mac-mini", "ssh": "you@mac-mini.local"}]
+
+HOSTS_FILE = APP_DIR / "hosts.json"
+SELF_SOURCE = HERE / "server.py"  # exe 化したときも同梱しておけば SSH 先へ送れる
+REMOTE = {}  # name -> {"data", "fetched", "error", "running", "days"}
+REMOTE_TTL = 30
+REMOTE_PATH = 'export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH";'
+
+
+def load_hosts():
+    try:
+        hosts = json.loads(HOSTS_FILE.read_bytes())
+    except (OSError, ValueError):
+        return []
+    return [h for h in hosts if isinstance(h, dict) and h.get("name") and h.get("ssh")]
+
+
+def ssh_argv(host, command):
+    # BatchMode: パスワードや鍵のパスフレーズを聞かれる設定だと固まるので、聞かずに失敗させる
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host["ssh"], REMOTE_PATH + command]
+
+
+def fetch_remote(host, days):
+    st = REMOTE[host["name"]]
+    try:
+        if host.get("ts"):
+            # Tailscale の相手で --share 付きのダッシュボードが動いていれば、そこから受け取る
+            data = ts_get(host["ts"], f"/share/sessions?days={float(days)}", timeout=20)
+        else:
+            p = subprocess.run(ssh_argv(host, f"python3 - --dump --days {float(days)}"),
+                               input=SELF_SOURCE.read_bytes(), capture_output=True, timeout=60)
+            if p.returncode != 0:
+                raise RuntimeError((p.stderr.decode("utf-8", "replace").strip().splitlines() or ["接続できません"])[-1])
+            data = json.loads(p.stdout)
+        st["data"], st["error"], st["days"] = data, None, days
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as e:
+        st["error"] = str(e) or type(e).__name__
+    finally:
+        st["fetched"] = now()
+        st["running"] = False
+
+
+def merge_remote(out, days):
+    out["hosts"] = []
+    for host in load_hosts() + ts_hosts():
+        st = REMOTE.setdefault(host["name"], {"data": None, "fetched": 0, "error": None,
+                                              "running": False, "days": None})
+        # Tailscale の相手はダッシュボードが動いていないことも多いので、失敗したら間隔をあける
+        ttl = REMOTE_TTL if (st["data"] or not host.get("ts")) else TS_RETRY
+        stale = now() - st["fetched"] > ttl or (st["days"] != days and st["data"])
+        if stale and not st["running"]:
+            st["running"] = True
+            threading.Thread(target=fetch_remote, args=(host, days), daemon=True).start()
+        if host.get("ts") and st["data"] is None:
+            continue  # 一度も応答のない端末は、ダッシュボードが無いとみなして出さない
+        out["hosts"].append({"name": host["name"], "error": st["error"], "fetched": st["fetched"],
+                             "via": "tailscale" if host.get("ts") else "ssh",
+                             "loading": st["data"] is None and st["error"] is None})
+        for name, t in ((st["data"] or {}).get("tools") or {}).items():
+            if name not in out["tools"]:
+                continue
+            for i in t.get("items", []):
+                i["host"] = host["name"]
+                # アプリで開く・貼り付けはそのマシンの画面でしかできない。
+                # Remote Control が付いていれば claude.ai で開いて、こちらで貼り付けて送れる
+                if i.get("reply_mode") == "paste" and i.get("auto_paste"):
+                    pass  # そのマシンのダッシュボードが、アプリに貼り付けて送る
+                elif i.get("reply_mode") == "paste" and i.get("bridge_id"):
+                    i["reply_mode"] = "bridge"
+                elif i.get("reply_mode") == "paste":
+                    i["can_reply"], i["no_reply"] = False, f"{host['name']} のアプリで開いているため、ここからは返信できません"
+                out["tools"][name]["items"].append(i)
+                INDEX[(name, i["id"], host["name"])] = i
+            out["tools"][name]["items"].sort(key=lambda x: -x["updated"])
+
+
+def bridge_url(item):
+    bid = item.get("bridge_id") or ""
+    if not re.fullmatch(r"session_[A-Za-z0-9]+", bid):
+        raise ValueError("Remote Control の ID が想定外の形式です")
+    return f"https://claude.ai/code/{bid}"
+
+
+def remote_host(item):
+    return next((h for h in load_hosts() + ts_hosts() if h["name"] == item.get("host")), None)
+
+
+# ---------------------------------------------------------------- Tailscale
+# --share で起動したダッシュボードは、自分の Tailscale アドレスでも待ち受ける。
+# 受け付けるのは `tailscale whois` で「自分と同じユーザーの端末」と確認できた相手だけ。
+# 見る側は `tailscale status` の端末一覧から、応答した端末を自動で並べる。
+
+TS_NET4 = ipaddress.ip_network("100.64.0.0/10")
+TS_NET6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+TS_RETRY = 30  # 未起動の相手には接続を断られるだけなので短くてよい
+TS_CACHE = {"status": None, "fetched": 0, "whois": {}}
+
+
+def ts_cli():
+    found = shutil.which("tailscale", path=CLI_PATH)
+    if found:
+        return found
+    for p in ("/Applications/Tailscale.app/Contents/MacOS/Tailscale", r"C:\Program Files\Tailscale\tailscale.exe"):
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def ts_json(*args):
+    exe = ts_cli()
+    if not exe:
+        return None
+    try:
+        # --json はサブコマンドの直後に置かないと、後ろの引数扱いになって効かない
+        p = subprocess.run([exe, args[0], "--json", *args[1:]], capture_output=True, timeout=10, **NO_WINDOW)
+        return json.loads(p.stdout) if p.returncode == 0 else None
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def ts_status():
+    if now() - TS_CACHE["fetched"] > 30:
+        TS_CACHE["status"], TS_CACHE["fetched"] = ts_json("status"), now()
+    return TS_CACHE["status"]
+
+
+def ts_hosts():
+    """同じユーザーのオンラインのパソコン（スマホは除く）"""
+    st = ts_status()
+    if not st or not st.get("Self"):
+        return []
+    me = st["Self"].get("UserID")
+    hosts = []
+    for peer in (st.get("Peer") or {}).values():
+        if not peer.get("Online") or peer.get("UserID") != me or peer.get("OS") in ("iOS", "android"):
+            continue
+        ip4 = next((ip for ip in peer.get("TailscaleIPs") or [] if "." in ip), None)
+        if ip4:
+            hosts.append({"name": peer.get("HostName") or ip4, "ts": ip4})
+    return hosts
+
+
+def ts_same_user(ip):
+    """相手の Tailscale アドレスが、このマシンと同じユーザーの端末か"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if addr not in TS_NET4 and addr not in TS_NET6:
+        return False
+    hit = TS_CACHE["whois"].get(ip)
+    if hit and now() - hit[0] < 300:
+        return hit[1]
+    st, who = ts_status(), ts_json("whois", ip)
+    ok = bool(st and who and st.get("Self", {}).get("UserID")
+              and (who.get("UserProfile") or {}).get("ID") == st["Self"]["UserID"])
+    TS_CACHE["whois"][ip] = (now(), ok)
+    return ok
+
+
+def ts_self_ip():
+    st = ts_status()
+    return next((ip for ip in ((st or {}).get("Self") or {}).get("TailscaleIPs") or [] if "." in ip), None)
+
+
+def ts_get(ip, path, timeout=10):
+    with urllib.request.urlopen(f"http://{ip}:{PORT}{path}", timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def ts_post(ip, path, body, timeout=20):
+    req = urllib.request.Request(f"http://{ip}:{PORT}{path}", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "X-Agent-Dashboard": "1"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+# ---------------------------------------------------------------- 開く / 返信
+
+def workdir(item):
+    cwd = item.get("cwd") or ""
+    return cwd if os.path.isdir(cwd) else str(HOME)
+
+
+def applescript_str(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def open_session(item):
+    tool, sid = item["tool"], item["id"]
+    if tool == "claude":
+        if item.get("desktop_id"):
+            url = f"claude://code/continue?session={item['desktop_id']}"
+        else:
+            # アプリに無いセッションは取り込んでから開く
+            url = f"claude://resume?session={sid}"
+        open_url(url)
+    elif tool == "codex":
+        open_url(f"codex://threads/{sid}")
+    elif tool == "antigravity" and item.get("via") == "ide":
+        # アプリの会話を直接開く URL は無いので、アプリを前面に出すだけ
+        if IS_MAC:
+            subprocess.run(["open", "-a", "Antigravity"], check=True)
+        else:
+            open_url("antigravity://")
+    elif tool == "antigravity" and IS_WIN:
+        # CLI の会話は新しいコマンドプロンプトで再開する（ID は UUID なのでそのまま渡せる）
+        if not re.fullmatch(r"[0-9a-fA-F-]{36}", sid):
+            raise ValueError("会話 ID の形式が想定外です")
+        subprocess.Popen(["cmd", "/c", "start", "agy", "cmd", "/k", cli("agy"), "--conversation", sid],
+                         cwd=workdir(item))
+    elif tool == "antigravity":
+        # CLI の会話はターミナルで再開する
+        cmd = f"cd {shlex.quote(workdir(item))} && agy --conversation {shlex.quote(sid)}"
+        script = f'tell application "Terminal"\nactivate\ndo script {applescript_str(cmd)}\nend tell'
+        subprocess.run(["osascript", "-e", script], check=True)
+
+
+JOBS = {}
+JOBS_LOCK = threading.Lock()
+REPLY_TIMEOUT = 30 * 60
+
+
+UPLOAD_DIR = CACHE_DIR / "uploads"
+IMAGE_TYPES = {"image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif", "image/webp": ".webp"}
+MAX_IMAGES, MAX_IMAGE_BYTES = 5, 10 * 1024 * 1024
+
+
+def save_images(images):
+    """data URL の画像を保存してパスを返す"""
+    paths = []
+    for img in (images or [])[:MAX_IMAGES]:
+        m = re.match(r"data:(image/[a-z+]+);base64,(.+)", img or "", re.S)
+        if not m or m.group(1) not in IMAGE_TYPES:
+            raise ValueError("対応していない画像形式です（PNG / JPEG / GIF / WebP）")
+        data = base64.b64decode(m.group(2))
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError("画像が大きすぎます（1枚 10MB まで）")
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        p = UPLOAD_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}{IMAGE_TYPES[m.group(1)]}"
+        p.write_bytes(data)
+        paths.append(str(p))
+    return paths
+
+
+def with_image_paths(text, paths):
+    # 画像を直接渡せないツールには、ファイルを読んでもらう
+    if not paths:
+        return text
+    return text + "\n\n添付画像（このファイルを読んで確認してください）:\n" + "\n".join(paths)
+
+
+def reply_command(item, text, images=()):
+    """(argv, stdin) を返す。本文はシェルを通さず渡す"""
+    tool, sid = item["tool"], item["id"]
+    if tool == "claude":
+        # 作業フォルダ外の画像も確認なしで読めるよう、保存先を許可フォルダに足す
+        extra = ["--add-dir", str(UPLOAD_DIR)] if images else []
+        return ["claude", "-p", "--resume", sid, *extra], with_image_paths(text, images)
+    if tool == "codex":
+        # `codex queue` は次にスレッドを開くまで実行されないので、その場で続きを実行する
+        flags = [a for p in images for a in ("-i", p)]
+        return ["codex", "exec", "resume", "--skip-git-repo-check", *flags, sid, "-"], text
+    text = with_image_paths(text, images)
+    if tool == "antigravity":
+        # 画像の保存先をワークスペースに加えて、確認なしで読めるようにする
+        extra = ["--add-dir", str(UPLOAD_DIR)] if images else []
+        return ["agy", "--conversation", sid, *extra, f"-p={text}"], None
+    raise ValueError(tool)
+
+
+def copy_and_open(item, text):
+    copy_text(text)
+    open_session(item)
+    app = {"claude": "Claude", "codex": "Codex"}.get(item["tool"], "アプリ")
+    paste = "Ctrl+V" if IS_WIN else "⌘V"
+    return f"{app} アプリで開きました。本文はコピー済みなので {paste} → Enter で送信してください"
+
+
+PASTE_LOCK = threading.Lock()
+# 本文はクリップボード経由で渡すので、スクリプトに利用者の文字列は入らない
+PASTE_SCRIPT = (
+    "$ws = New-Object -ComObject WScript.Shell; "
+    "$p = Get-Process Claude -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1; "
+    "if (-not $p -or -not $ws.AppActivate($p.Id)) { exit 2 }; "
+    "Start-Sleep -Milliseconds 400; $ws.SendKeys('^v'); Start-Sleep -Milliseconds 400; $ws.SendKeys('{ENTER}')"
+)
+
+
+def auto_paste_send(item, text):
+    """Claude アプリでチャットを開き、本文を貼り付けて Enter を押す。アプリ側のチャットは止めない"""
+    with PASTE_LOCK:  # 同時に送ると貼り付け先が入れ替わるので1件ずつ
+        copy_text(text)
+        open_session(item)
+        time.sleep(2.5)  # アプリがそのチャットを表示し終えるのを待つ
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", PASTE_SCRIPT],
+                           capture_output=True, timeout=30, **NO_WINDOW)
+    if r.returncode != 0:
+        raise ValueError("Claude アプリを前面に出せませんでした（画面がロック中かもしれません）")
+    return "Claude アプリに貼り付けて送信しました"
+
+
+def run_job(job_id, argv, stdin, cwd, fallback=None):
+    job = JOBS[job_id]
+    if argv[0] in ("claude", "codex", "agy"):
+        argv = [cli(argv[0]), *argv[1:]]
+    try:
+        # Windows の既定の文字コード (cp932) では CLI の UTF-8 出力が化けるので明示する
+        p = subprocess.run(
+            argv, input=stdin, cwd=cwd, capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=REPLY_TIMEOUT, env=CLI_ENV, **NO_WINDOW,
+        )
+        job["output"] = (p.stdout or "").strip() or (p.stderr or "").strip()
+        job["status"] = "done" if p.returncode == 0 else "error"
+        # Codex アプリで開いているスレッドは CLI から書き込めない。アプリで開いて貼り付けに切り替える
+        if p.returncode != 0 and fallback and "active writer" in (p.stderr or "") + (p.stdout or ""):
+            job["output"], job["status"] = fallback(), "done"
+    except subprocess.TimeoutExpired:
+        job["status"], job["output"] = "error", "タイムアウトしました"
+    except OSError as e:
+        job["status"], job["output"] = "error", str(e)
+    job["finished"] = now()
+
+
+def start_reply(item, text, images=(), stop=False):
+    if stop:
+        # 「止めて送る」: アプリ側のプロセスを止めて、CLI で同じ会話の続きを送る
+        if not item.get("can_stop_send"):
+            raise ValueError("このチャットは「止めて送る」に対応していません")
+        if item.get("host"):
+            return start_remote_reply(item, text, images, stop=True)
+        stop_idle_session(item["id"])
+        item = {**item, "reply_mode": "cli"}
+    elif not item.get("can_reply"):
+        raise ValueError(item.get("no_reply") or "このセッションには今は返信できません。アプリで開いて返信してください")
+    if item.get("reply_mode") == "bridge":
+        # 別マシンで開いているセッションは claude.ai で開き、本文はこのマシンのクリップボードへ
+        copy_text(with_image_paths(text, []))
+        open_url(bridge_url(item))
+        job_id = uuid.uuid4().hex[:12]
+        paste = "Ctrl+V" if IS_WIN else "⌘V"
+        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"], "status": "done",
+                        "output": f"claude.ai で開きました。本文はコピー済みなので {paste} → Enter で送信してください",
+                        "started": now(), "finished": now()}
+        return JOBS[job_id]
+    if item.get("host"):
+        return start_remote_reply(item, text, images)
+    images = save_images(images)
+    job_id = uuid.uuid4().hex[:12]
+    if item.get("reply_mode") == "paste":
+        # クリップボードは1つしか持てないので、画像はパスを本文に添える
+        body = with_image_paths(text, images)
+        msg = auto_paste_send(item, body) if item.get("auto_paste") else copy_and_open(item, body)
+        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"], "status": "done",
+                        "output": msg, "started": now(), "finished": now()}
+        return JOBS[job_id]
+    argv, stdin = reply_command(item, text, images)
+    fallback = (lambda: copy_and_open(item, with_image_paths(text, images))) if item["tool"] == "codex" else None
+    with JOBS_LOCK:
+        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"],
+                        "status": "running", "output": "", "started": now()}
+    threading.Thread(target=run_job, args=(job_id, argv, stdin, workdir(item), fallback), daemon=True).start()
+    return JOBS[job_id]
+
+
+def start_remote_reply(item, text, images, stop=False):
+    """そのマシンの作業フォルダで CLI を SSH 越しに実行する。画像はそのマシンに無いので未対応"""
+    host = remote_host(item)
+    if host is None:
+        raise ValueError("このマシンに接続できません")
+    if images:
+        raise ValueError("リモートのセッションには画像を添付できません")
+    if host.get("ts"):
+        return start_ts_reply(host, item, text, stop)
+    if stop:
+        raise ValueError("SSH でつないだマシンでは「止めて送る」は使えません")
+    argv, stdin = reply_command(item, text)
+    cwd = shlex.quote(item.get("cwd") or "~")
+    command = f"cd {cwd} 2>/dev/null || cd ~; " + " ".join(shlex.quote(a) for a in argv)
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"], "host": host["name"],
+                        "status": "running", "output": "", "started": now()}
+    threading.Thread(target=run_job, args=(job_id, ssh_argv(host, command), stdin, str(HOME)),
+                     daemon=True).start()
+    return JOBS[job_id]
+
+
+def start_ts_reply(host, item, text, stop=False):
+    """相手のダッシュボードに返信を頼み、その実行状況をこちらのジョブに写す"""
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"], "host": host["name"],
+                        "status": "running", "output": "", "started": now()}
+
+    def relay():
+        job = JOBS[job_id]
+        try:
+            remote = ts_post(host["ts"], "/share/reply", {"tool": item["tool"], "id": item["id"], "text": text, "stop": stop})
+            if remote.get("error"):
+                raise RuntimeError(remote["error"])
+            deadline = now() + REPLY_TIMEOUT
+            while remote.get("status") == "running" and now() < deadline:
+                time.sleep(2)
+                remote = ts_get(host["ts"], f"/share/job?id={remote['id']}")
+            job["status"] = remote.get("status") if remote.get("status") != "running" else "error"
+            job["output"] = remote.get("output") or ("タイムアウトしました" if job["status"] == "error" else "")
+        except urllib.error.HTTPError as e:
+            try:
+                job["output"] = json.loads(e.read()).get("error") or str(e)
+            except ValueError:
+                job["output"] = str(e)
+            job["status"] = "error"
+        except (OSError, ValueError, RuntimeError) as e:
+            job["status"], job["output"] = "error", f"{host['name']} に送れませんでした: {e}"
+        job["finished"] = now()
+
+    threading.Thread(target=relay, daemon=True).start()
+    return JOBS[job_id]
+
+
+class ShareHandler(BaseHTTPRequestHandler):
+    """--share のとき Tailscale アドレスで待ち受ける窓口。自分の端末からの一覧取得と返信だけ受ける"""
+
+    def send_json(self, obj, code=200):
+        Handler.send_json(self, obj, code)
+
+    def allowed(self):
+        if ts_same_user(self.client_address[0]):
+            return True
+        self.send_error(403)
+        return False
+
+    def do_GET(self):
+        if not self.allowed():
+            return
+        url = urlparse(self.path)
+        q = parse_qs(url.query)
+        if url.path == "/share/sessions":
+            self.send_json(snapshot(float(q.get("days", ["3"])[0]), with_remote=False))
+        elif url.path == "/share/job":
+            job = JOBS.get(q.get("id", [""])[0])
+            self.send_json(job or {"error": "not found"}, 200 if job else 404)
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        if not self.allowed():
+            return
+        if urlparse(self.path).path != "/share/reply" or self.headers.get("X-Agent-Dashboard") != "1":
+            self.send_error(404)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            data = json.loads(self.rfile.read(min(n, 1024 * 1024)) or b"{}")
+            item = INDEX.get((data.get("tool"), data.get("id"), None))
+            if item is None:
+                raise ValueError("セッションが見つかりません")
+            stop = bool(data.get("stop"))
+            if item.get("reply_mode") == "paste" and not stop and not item.get("auto_paste"):
+                raise ValueError("このマシンのアプリで開いているため、離れた場所からは返信できません")
+            text = (data.get("text") or "").strip()
+            if not text:
+                raise ValueError("本文が空です")
+            self.send_json(start_reply(item, text, stop=stop))
+        except ValueError as e:
+            self.send_json({"error": str(e)}, 400)
+
+    def log_message(self, *args):
+        pass
+
+
+def start_share_server():
+    ip = ts_self_ip()
+    if not ip:
+        print("Tailscale が見つからないか未接続のため、共有はしません", flush=True)
+        return
+    try:
+        srv = ThreadingHTTPServer((ip, PORT), ShareHandler)
+    except OSError as e:
+        print(f"Tailscale アドレス {ip}:{PORT} で待ち受けできません: {e}", flush=True)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    print(f"共有中: http://{ip}:{PORT}（同じ Tailscale ユーザーの端末だけ）", flush=True)
+
+
+class Handler(BaseHTTPRequestHandler):
+    def send_json(self, obj, code=200):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def local_request(self):
+        # 他サイトからの localhost 宛てリクエストや DNS rebinding を弾く
+        host = (self.headers.get("Host") or "").split(":")[0]
+        return host in ("localhost", "127.0.0.1")
+
+    def do_GET(self):
+        if not self.local_request():
+            self.send_error(403)
+            return
+        url = urlparse(self.path)
+        q = parse_qs(url.query)
+        if url.path == "/api/sessions":
+            self.send_json(snapshot(float(q.get("days", ["3"])[0])))
+            return
+        if url.path == "/api/job":
+            job = JOBS.get(q.get("id", [""])[0])
+            self.send_json(job or {"error": "not found"}, 200 if job else 404)
+            return
+        if url.path not in ("/", "/index.html"):
+            self.send_error(404)
+            return
+        body = (HERE / "index.html").read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        # 独自ヘッダー必須にすることでブラウザの CORS プリフライトを強制し、他サイトから叩けなくする
+        if not self.local_request() or self.headers.get("X-Agent-Dashboard") != "1":
+            self.send_error(403)
+            return
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if n > 60 * 1024 * 1024:  # 画像5枚 + base64 の膨らみぶん
+                raise ValueError("too large")
+            data = json.loads(self.rfile.read(n) or b"{}")
+        except ValueError:
+            self.send_json({"error": "bad request"}, 400)
+            return
+        path = urlparse(self.path).path
+        if data.get("tool") == "muse" and path == "/api/open":
+            # Muse は会話がローカルに無いので一覧は出せない。アプリを呼び出すだけ
+            if not IS_MAC:
+                self.send_json({"error": "Muse アプリは Mac 版のみです"}, 400)
+                return
+            r = subprocess.run(["open", "-a", "Muse"], capture_output=True, text=True)
+            self.send_json({"ok": True} if r.returncode == 0 else {"error": "Muse アプリが見つかりません"},
+                           200 if r.returncode == 0 else 400)
+            return
+        item = INDEX.get((data.get("tool"), data.get("id"), data.get("host") or None))
+        if item is None:
+            self.send_json({"error": "セッションが見つかりません。再読み込みしてください"}, 404)
+            return
+        try:
+            if path == "/api/open":
+                if item.get("host") and item.get("bridge_id"):
+                    open_url(bridge_url(item))
+                    self.send_json({"ok": True})
+                    return
+                if item.get("host"):
+                    raise ValueError(f"{item['host']} のセッションは、そのマシンで開いてください")
+                open_session(item)
+                self.send_json({"ok": True})
+            elif path == "/api/reply":
+                text = (data.get("text") or "").strip()
+                images = data.get("images") or []
+                if not text and not images:
+                    raise ValueError("本文が空です")
+                self.send_json(start_reply(item, text or "この画像を見てください", images, stop=bool(data.get("stop"))))
+            else:
+                self.send_error(404)
+        except (ValueError, subprocess.CalledProcessError, OSError) as e:
+            self.send_json({"error": str(e)}, 400)
+
+    def log_message(self, *args):
+        pass
+
+
+def install_autostart(remove=False):
+    """Windows: スタートアップフォルダにコンソールなしで --share 起動する .cmd を置く"""
+    if not IS_WIN:
+        print("自動起動の登録は Windows 用です。Mac は launchd の plist を使ってください（README 参照）")
+        return
+    startup = Path(os.environ["APPDATA"]) / "Microsoft/Windows/Start Menu/Programs/Startup"
+    target = startup / "agent-dashboard.cmd"
+    if remove:
+        target.unlink(missing_ok=True)
+        print(f"自動起動を外しました: {target}")
+        return
+    if FROZEN:
+        cmd = f'"{sys.executable}" --share'
+    else:
+        # pythonw なら黒いコンソール窓が出ない
+        pyw = Path(sys.executable).with_name("pythonw.exe")
+        cmd = f'"{pyw if pyw.exists() else sys.executable}" "{Path(__file__).resolve()}" --share'
+    target.write_text(f'@echo off\r\nstart "" /b {cmd}\r\n', encoding="utf-8")
+    print(f"ログイン時に自動起動するよう登録しました: {target}\n今すぐ起動するには: {cmd}")
+
+
+if __name__ == "__main__":
+    if "--dump" in sys.argv:
+        # リモートから SSH 越しに呼ばれる。そのマシンの分だけを JSON で返す
+        days = float(sys.argv[sys.argv.index("--days") + 1]) if "--days" in sys.argv else 3
+        print(json.dumps(snapshot(days, with_remote=False), ensure_ascii=False))
+        sys.exit()
+    if "--install" in sys.argv or "--uninstall" in sys.argv:
+        install_autostart(remove="--uninstall" in sys.argv)
+        sys.exit()
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    except OSError as e:
+        if e.errno not in (errno.EADDRINUSE, 10048):  # 10048: Windows のポート使用中
+            raise
+        print(f"ポート {PORT} は使用中です（すでに起動済みなら http://localhost:{PORT} を開いてください）。"
+              f"\n別ポートで起動: PORT=8766 python3 {sys.argv[0]}")
+        sys.exit(1)
+    print(f"Agent dashboard: http://localhost:{PORT}", flush=True)
+    if "--share" in sys.argv:
+        start_share_server()
+    srv.serve_forever()
