@@ -53,6 +53,7 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 .meta { color: var(--muted); font-size: 12px; margin: 2px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg { margin: 6px 0 0 16px; font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
 .msg b { color: var(--muted); font-weight: 500; margin-right: 4px; }
+.msg a, .job a { color: var(--c); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
 .msg.full { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; max-height: 420px; overflow: auto;
   cursor: text; user-select: text; }
 .actions .spacer { flex: 1; }
@@ -133,6 +134,11 @@ const TOOLS = [
 const STATE_LABEL = { ask: "質問あり", busy: "動作中", open: "開いている", done: "", archived: "アーカイブ" };
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// 文中の URL をクリックできるリンクにする（エスケープ済みの文字列に使う）。
+// 日本語の句読点や閉じかっこ、末尾の「…」で省略された URL はリンクにしない
+const URL_RE = /https?:\/\/(?:(?!&quot;|&lt;|&gt;)[^\s<>"'`*）」』】、。…])*(?:(?!&quot;|&lt;|&gt;)[^\s<>"'`*）」』】、。…).,:;!?])/g;
+const linkify = (html) => html.replace(URL_RE, (u, at, all) =>
+  all[at + u.length] === "…" ? u : `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
 
 let hiddenCols = new Set();
 try {
@@ -194,8 +200,8 @@ const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 function msgRow(label, short, fullText, expanded) {
   if (!short) return "";
   return expanded && fullText
-    ? `<div class="msg full"><b>${label}</b>${esc(fullText)}</div>`
-    : `<div class="msg"><b>${label}</b>${esc(short)}</div>`;
+    ? `<div class="msg full"><b>${label}</b>${linkify(esc(fullText))}</div>`
+    : `<div class="msg"><b>${label}</b>${linkify(esc(short))}</div>`;
 }
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); return toast("コピーしました"); } catch {}
@@ -250,7 +256,7 @@ function card(it) {
           : `${it.auto_paste && it.can_stop_send
             ? `<button data-act="stopsend" title="アプリ側のチャットを止めて裏で送ります。返事はここに出ます（アプリには「中断」と出ます）">止めて送る</button>` : ""}<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
     </div>` : ""}
-    ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? "実行中…" : esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました"))}</div>
+    ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? "実行中…" : linkify(esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました")))}</div>
       ${job.status === "done" && job.output ? `<button class="copy" data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}</div>` : ""}
   </div>`;
 }
