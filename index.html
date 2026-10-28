@@ -474,7 +474,9 @@ async function load() {
 $("#days").onchange = () => { try { localStorage.setItem("days", $("#days").value); } catch {} load(); };
 $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#showAuto").checked ? "1" : "0"); } catch {} render(); };
 load();
-setInterval(load, 5000);
+// 見ていない間（ほかのタブやウインドウの裏）は更新しない。電池と通信の節約。戻ってきたらすぐ更新する
+setInterval(() => { if (!document.hidden) load(); }, 5000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>

@@ -8,6 +8,8 @@
   python server.py --install   -> Windows: ログイン時に --share 付きで自動起動するよう登録
 """
 import base64
+import gzip
+import hashlib
 import errno
 import ipaddress
 import json
@@ -781,7 +783,7 @@ def fetch_remote(host, days):
     try:
         if host.get("ts"):
             # Tailscale の相手で --share 付きのダッシュボードが動いていれば、そこから受け取る
-            data = ts_get(host["ts"], f"/share/sessions?days={float(days)}", timeout=20)
+            data = ts_get_sessions(host["ts"], days, st)
         else:
             p = subprocess.run(ssh_argv(host, f"python3 - --dump --days {float(days)}"),
                                input=SELF_SOURCE.read_bytes(), capture_output=True, timeout=60)
@@ -921,6 +923,25 @@ def ts_same_user(ip):
 def ts_self_ip():
     st = ts_status()
     return next((ip for ip in ((st or {}).get("Self") or {}).get("TailscaleIPs") or [] if "." in ip), None)
+
+
+def ts_get_sessions(ip, days, st):
+    """別マシンの一覧を取る。通信を減らすため、前回と同じなら中身を送らせず（304）、送るときは圧縮させる"""
+    req = urllib.request.Request(f"http://{ip}:{PORT}/share/sessions?days={float(days)}",
+                                 headers={"Accept-Encoding": "gzip"})
+    if st.get("etag") and st.get("data") is not None and st.get("days") == days:
+        req.add_header("If-None-Match", st["etag"])
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            body = r.read()
+            if r.headers.get("Content-Encoding") == "gzip":
+                body = gzip.decompress(body)
+            st["etag"] = r.headers.get("ETag")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        if e.code == 304:
+            return st["data"]
+        raise
 
 
 def ts_get(ip, path, timeout=10):
@@ -1324,6 +1345,28 @@ class ShareHandler(BaseHTTPRequestHandler):
     def send_json(self, obj, code=200):
         Handler.send_json(self, obj, code)
 
+    def send_shared(self, data):
+        # 中身が変わっていなければ 304 だけ返す（生成時刻は比べない）。変わっていれば圧縮して送る
+        body = json.dumps(data, ensure_ascii=False).encode()
+        etag = '"' + hashlib.sha1(json.dumps(data.get("tools"), ensure_ascii=False, sort_keys=True)
+                                  .encode()).hexdigest() + '"'
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
+        if gz:
+            body = gzip.compress(body, 6)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("ETag", etag)
+        if gz:
+            self.send_header("Content-Encoding", "gzip")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def allowed(self):
         if ts_same_user(self.client_address[0]):
             return True
@@ -1336,7 +1379,7 @@ class ShareHandler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         if url.path == "/share/sessions":
-            self.send_json(snapshot(float(q.get("days", ["3"])[0]), with_remote=False))
+            self.send_shared(snapshot(float(q.get("days", ["3"])[0]), with_remote=False))
         elif url.path == "/share/job":
             job = JOBS.get(q.get("id", [""])[0])
             self.send_json(job or {"error": "not found"}, 200 if job else 404)
