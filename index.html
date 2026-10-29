@@ -105,13 +105,20 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .reply-box textarea:focus { outline: none; border-color: var(--c); }
 .reply-box .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
 .reply-box .hint { color: var(--muted); font-size: 11px; margin-right: auto; }
+/* 送信を押してから返事が来るまでのくるくる */
+.spin { display: inline-block; width: 10px; height: 10px; border: 2px solid currentColor; border-right-color: transparent;
+  border-radius: 50%; animation: spin .7s linear infinite; margin-right: 5px; vertical-align: -1px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.reply-box.sending button { cursor: progress; }
+.reply-box.sending button.primary:disabled { opacity: 1; }  /* くるくるが薄くならないように */
 /* Remote Control の状態（起動中の Claude のチャットだけ）と、付いたり外れたりした記録 */
 .rc { display: inline-block; font-size: 10px; line-height: 15px; padding: 0 5px; margin-left: 6px; border-radius: 4px;
   border: 1px solid currentColor; vertical-align: 1px; }
 .rc.on { color: var(--open); }
 /* コンテキストの量。モデルの上限に対する割合（上限はモデル名からの推定。アプリの表示と同じ計算） */
-.ctx { white-space: nowrap; }
-.ctx .bar { display: inline-block; width: 36px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden;
+/* 「○分前」の横に、棒と % だけを小さく出す（1行を取らない） */
+.ctx { white-space: nowrap; flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ctx .bar { display: inline-block; width: 28px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden;
   vertical-align: 2px; margin-left: 4px; }
 .ctx .bar i { display: block; height: 100%; background: var(--c); }
 .ctx.warn .bar i { background: var(--busy); }
@@ -275,7 +282,7 @@ const NO_REPLY = {
 };
 // 再描画（5秒ごと）をまたいで残す UI 状態
 const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set(),
-  newOpen: new Set(), newForm: {} };  // newForm[道具] = { host, cwd, text }
+  newOpen: new Set(), newForm: {}, sending: new Set() };  // sending: 送信を押して返事待ちの欄（カードのキーか new:道具）  // newForm[道具] = { host, cwd, text }
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
@@ -315,8 +322,7 @@ function ctxMeter(it) {
   if (!c || !c.tokens || !c.window) return "";
   const pct = Math.min(100, Math.round(c.tokens / c.window * 100));
   const cls = pct >= 85 ? "full" : pct >= 65 ? "warn" : "";
-  // 狭い列でも「…」で隠れないよう、モデル名の行とは分けて1行で出す
-  return `<div class="meta ctx ${cls}" title="コンテキスト ${c.tokens.toLocaleString()} / 上限 ${c.window.toLocaleString()} トークン（上限はモデル名からの推定）">コンテキスト ${pct}%<span class="bar"><i style="width:${pct}%"></i></span></div>`;
+  return `<span class="ctx ${cls}" title="コンテキスト ${c.tokens.toLocaleString()} / 上限 ${c.window.toLocaleString()} トークン（上限はモデル名からの推定）"><span class="bar"><i style="width:${pct}%"></i></span> ${pct}%</span>`;
 }
 function card(it) {
   const k = key(it);
@@ -330,11 +336,10 @@ function card(it) {
   const job = ui.jobs[k];
   return `<div class="card ${it.state}" data-key="${esc(k)}">
     <div class="top"><span class="dot"></span><span class="title">${esc(it.title)}</span>
-      <span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
+      ${ctxMeter(it)}<span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
     <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}${rc}</div>
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
-    ${ctxMeter(it)}
     ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
     ${msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply)}
     ${msgRow("応答", it.reply, it.reply_full, full, true, true)}
@@ -362,7 +367,7 @@ function card(it) {
           : `${it.auto_paste && it.can_stop_send
             ? `<button data-act="stopsend" title="アプリ側のチャットを止めて裏で送ります。返事はここに出ます（アプリには「中断」と出ます）">止めて送る</button>` : ""}<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
     </div>` : ""}
-    ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? "実行中…" : linkify(esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました")))}</div>
+    ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? `<span class="spin"></span>実行中…` : linkify(esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました")))}</div>
       ${job.status === "done" && job.output ? `<button class="copy" data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}</div>` : ""}
   </div>`;
 }
@@ -392,19 +397,36 @@ async function openItem(it) {
   try { await post("/api/open", { tool: it.tool, id: it.id, host: it.host }); toast(`「${it.title}」を開きました`); }
   catch (e) { toast(e.message); }
 }
+// 押した瞬間に、その欄のボタンを止めてくるくるを出す（自動貼り付けなどで数秒かかるため）。描き直しても applySending() で戻す
+const boxOf = (k) => k.startsWith("new:") ? document.querySelector(`.new-box[data-tool="${k.slice(4)}"]`)
+  : document.querySelector(`.card[data-key="${CSS.escape(k)}"] .reply-box`);
+function applySending() {
+  ui.sending.forEach((k) => {
+    const box = boxOf(k);
+    if (!box || box.classList.contains("sending")) return;
+    box.classList.add("sending");
+    box.querySelectorAll("button, textarea, input, select").forEach((el) => (el.disabled = true));
+    const btn = box.querySelector("button.primary");
+    if (btn) btn.innerHTML = `<span class="spin"></span>${k.startsWith("new:") ? "開始中…" : "送信中…"}`;
+  });
+}
 async function sendReply(it, k, stop = false) {
   const text = (ui.drafts[k] || "").trim();
   const images = ui.images[k] || [];
   if (!text && !images.length) return;
+  if (ui.sending.has(k)) return;  // 二度押しで二重に送らない
+  ui.sending.add(k);
+  applySending();
   try {
     const job = await post("/api/reply", { tool: it.tool, id: it.id, host: it.host, text, images, stop });
+    ui.sending.delete(k);
     ui.jobs[k] = job;
     ui.drafts[k] = "";
     ui.images[k] = [];
     ui.replyOpen.delete(k);
     render();
     pollJob(k, job.id);
-  } catch (e) { toast(e.message); }
+  } catch (e) { ui.sending.delete(k); render(); toast(e.message); }
 }
 async function pollJob(k, id) {
   while (true) {
@@ -601,20 +623,25 @@ function newBox(tool, t) {
     <textarea name="text" placeholder="新しいチャットで頼むこと（Tab → Enter か Ctrl+Enter で開始）">${esc(f.text || "")}</textarea>
     <div class="row"><span class="hint" title="そのフォルダで CLI の新しいチャットを始めます。ファイル編集など許可が要る操作は、確認を出せないので止まります">許可が要る操作は止まります</span>
       <button data-act="newcancel">やめる</button><button class="primary" data-act="newsend">開始</button></div>
-    ${job ? `<div class="job ${job.status}">${job.status === "running" ? "実行中…" : linkify(esc(job.output || (job.status === "done" ? "始めました" : "失敗しました")))}</div>` : ""}
+    ${job ? `<div class="job ${job.status}">${job.status === "running" ? `<span class="spin"></span>実行中…` : linkify(esc(job.output || (job.status === "done" ? "始めました" : "失敗しました")))}</div>` : ""}
   </div>`;
 }
 async function sendNew(tool) {
   const f = ui.newForm[tool] || {};
   const text = (f.text || "").trim();
   if (!text) return toast("依頼文を書いてください");
+  const k = `new:${tool}`;
+  if (ui.sending.has(k)) return;
+  ui.sending.add(k);
+  applySending();
   try {
     const job = await post("/api/new", { tool, host: f.host || null, cwd: f.cwd || "", text });
+    ui.sending.delete(k);
     ui.jobs[`new:${tool}`] = job;
     f.text = "";
     render();
     pollJob(`new:${tool}`, job.id);
-  } catch (e) { toast(e.message); }
+  } catch (e) { ui.sending.delete(k); render(); toast(e.message); }
 }
 document.addEventListener("click", (e) => {
   const nb = e.target.closest("[data-new]");
@@ -675,6 +702,7 @@ function render() {
     ? shown.map((t) => column(t, last)).join("")
     : `<div class="empty">表示する列がありません。右上で選んでください</div>`;
   pruneMore();
+  applySending();
   document.querySelectorAll("details").forEach((d, i) => (d.open = !!open[i]));
   scrolls.forEach(([k, cls, top]) => {
     const el = k && document.querySelector(`.card[data-key="${CSS.escape(k)}"] .${cls.trim().split(/\s+/).join(".")}`);
