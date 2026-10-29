@@ -917,6 +917,66 @@ def claude_usage_limits():
     return CLAUDE_USAGE["limits"]
 
 
+# Codex の使用制限は、Codex アプリと同じく app-server の account/rateLimits/read で取る（モデルは呼ばない）。
+# 会話の記録（rollout）に残る値は、記録を残さない実行（使い捨ての exec など）では更新されないため
+CODEX_USAGE = {"limits": None, "fetched": 0, "running": False}
+CODEX_USAGE_TTL = 5 * 60
+
+
+def refresh_codex_usage():
+    p = None
+    try:
+        p = subprocess.Popen([cli("codex"), "app-server"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, encoding="utf-8", cwd=str(HOME),
+                             env=CLI_ENV, **NO_WINDOW)
+        reqs = [{"id": 1, "method": "initialize", "params": {"clientInfo": {"name": "agent-dashboard", "version": "1"}}},
+                {"method": "initialized"},
+                {"id": 2, "method": "account/rateLimits/read"}]
+        p.stdin.write("".join(json.dumps(r) + "\n" for r in reqs))
+        p.stdin.flush()
+        # 応答が来ないと readline が戻らないので、20 秒たったら止めて読み取りを終わらせる
+        timer = threading.Timer(20, p.kill)
+        timer.daemon = True
+        timer.start()
+        result = None
+        while True:
+            line = p.stdout.readline()
+            if not line:
+                break
+            try:
+                m = json.loads(line)
+            except ValueError:
+                continue
+            if m.get("id") == 2:
+                result = m.get("result") or {}
+                break
+        rl = (result or {}).get("rateLimits") or {}
+
+        def win(w):
+            if not w or w.get("usedPercent") is None:
+                return None
+            return {"used_percent": w["usedPercent"], "resets_at": w.get("resetsAt") or 0,
+                    "window_minutes": w.get("windowDurationMins")}
+
+        found = {k: win(rl.get(k)) for k in ("primary", "secondary")}
+        if any(found.values()):
+            CODEX_USAGE["limits"] = {"ts": now(), **found}
+    except (OSError, ValueError):
+        pass
+    finally:
+        if p:
+            p.kill()
+        CODEX_USAGE["fetched"] = now()
+        CODEX_USAGE["running"] = False
+
+
+def codex_usage_limits():
+    if not CODEX_USAGE["running"] and now() - CODEX_USAGE["fetched"] > CODEX_USAGE_TTL:
+        CODEX_USAGE["running"] = True
+        threading.Thread(target=refresh_codex_usage, daemon=True).start()
+    return CODEX_USAGE["limits"]
+
+
 CLAUDE_LIMITS = CACHE_DIR / "claude_rate_limits.json"
 
 
@@ -984,6 +1044,9 @@ def _snapshot(days, with_remote=True):
             if name == "claude":
                 # statusline の記録と /usage のうち、新しい方を使う
                 limits = [x for x in [claude_limits(), claude_usage_limits() if with_remote else None] if x]
+            if name == "codex" and with_remote:
+                # 会話の記録に残った値と app-server から取った値のうち、新しい方を使う
+                limits += [x for x in [codex_usage_limits()] if x]
             if name == "antigravity" and with_remote:
                 out["tools"][name]["quota"] = agy_quota()
             if limits:
