@@ -33,9 +33,10 @@ h1 { font-size: 17px; margin: 0; font-weight: 650; }
   color: var(--text); font-variant-numeric: tabular-nums; }
 .ring.warn { --c: var(--busy) !important; }
 .ring.full { --c: #c0392b !important; }
-.controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-left: auto; color: var(--muted); font-size: 13px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-left: auto; color: var(--muted); font-size: 13px; }
+.controls > label { display: inline-flex; align-items: center; gap: 4px; height: 24px; }
 select, input { font: inherit; }
-select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
+select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 0 4px; height: 24px; }
 #updated { font-variant-numeric: tabular-nums; }
 main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr)); gap: 16px; padding: 16px 20px 40px; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px 40px; } header { padding: 12px 16px; } }
@@ -116,7 +117,7 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .err { color: #c0392b; font-size: 12px; }
 .cols { display: flex; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line); border-radius: 999px;
-  padding: 1px 10px 1px 8px; cursor: pointer; user-select: none; font-size: 12px; }
+  height: 24px; box-sizing: border-box; padding: 0 10px 0 8px; cursor: pointer; user-select: none; font-size: 12px; white-space: nowrap; }
 .chip input { display: none; }
 .chip .sw { width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
 .chip:has(input:not(:checked)) { opacity: .45; }
@@ -129,8 +130,11 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .meta .model { color: var(--text); opacity: .75; }
 .host { display: inline-block; font-size: 11px; line-height: 16px; padding: 0 6px; margin-right: 6px; border-radius: 4px;
   border: 1px solid var(--line); color: var(--text); }
-#hosts { display: flex; gap: 6px; }
-#hosts .host.err { color: #c0392b; border-color: currentColor; }
+/* 端末ごとの表示切り替え。道具の列とのあいだに細い区切り線を入れる */
+#hosts { display: flex; gap: 6px; padding-left: 12px; border-left: 1px solid var(--line); }
+#hosts:empty { display: none; }
+#hosts .chip { --c: var(--muted); }
+#hosts .chip.err { color: #c0392b; border-color: currentColor; --c: #c0392b; }
 .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 .thumbs div { position: relative; }
 .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); display: block; }
@@ -145,6 +149,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
   <div id="rings"></div>
   <div class="controls">
     <div class="cols" id="cols"></div>
+    <span id="hosts"></span>
     <label>期間 <select id="days">
       <option value="1">24時間</option><option value="3" selected>3日</option>
       <option value="7">7日</option><option value="30">30日</option>
@@ -153,7 +158,6 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
       <option value="2">小</option><option value="5">中</option><option value="10">大</option>
     </select></label>
     <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
-    <span id="hosts"></span>
     <span id="updated"></span>
   </div>
 </header>
@@ -176,15 +180,22 @@ const linkify = (html) => html.replace(URL_RE, (u, at, all) =>
   all[at + u.length] === "…" ? u : `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
 
 let hiddenCols = new Set();
+let hiddenHosts = new Set();  // 表示しない端末（"" はこのPC）
 try {
   $("#days").value = localStorage.getItem("days") || "3";
   $("#showAuto").checked = localStorage.getItem("showAuto") === "1";
   $("#rows").value = localStorage.getItem("rows") || "2";
   hiddenCols = new Set(JSON.parse(localStorage.getItem("hiddenCols") || "[]"));
+  hiddenHosts = new Set(JSON.parse(localStorage.getItem("hiddenHosts") || "[]"));
 } catch {}
 $("#cols").innerHTML = TOOLS.map(([k, name, color]) =>
   `<label class="chip" style="--c:${color}" title="${name} の列を表示/非表示">
     <input type="checkbox" value="${k}" ${hiddenCols.has(k) ? "" : "checked"}><span class="sw"></span>${name}</label>`).join("");
+$("#hosts").onchange = (e) => {
+  e.target.checked ? hiddenHosts.delete(e.target.value) : hiddenHosts.add(e.target.value);
+  try { localStorage.setItem("hiddenHosts", JSON.stringify([...hiddenHosts])); } catch {}
+  render();
+};
 $("#cols").onchange = (e) => {
   e.target.checked ? hiddenCols.delete(e.target.value) : hiddenCols.add(e.target.value);
   try { localStorage.setItem("hiddenCols", JSON.stringify([...hiddenCols])); } catch {}
@@ -494,7 +505,7 @@ function column([key, name, color], data) {
   if (key === "muse") return museColumn(name, color);
   const t = data.tools[key] || { items: [] };
   const showAuto = $("#showAuto").checked;
-  const all = t.items;
+  const all = t.items.filter((i) => !hiddenHosts.has(i.host || ""));
   const items = all.filter((i) => showAuto || !i.auto);
   const hidden = all.length - items.length;
   // 質問に答えないと進まないものを先頭に
@@ -537,11 +548,15 @@ function render() {
   });
   $("#updated").textContent = "更新 " + new Date(last.generated * 1000).toLocaleTimeString();
   $("#rings").innerHTML = rings(last);
-  // hosts.json に書いたマシンごとの接続状態
-  $("#hosts").innerHTML = (last.hosts || []).map((h) => {
+  // 端末ごとの表示切り替え（つながっている別の端末があるときだけ出す）。名前の後ろの … ✕ は接続状態
+  const hosts = last.hosts || [];
+  const hostChip = (value, name, title, mark = "", err = false) =>
+    `<label class="chip${err ? " err" : ""}" title="${esc(title)}（クリックで表示/非表示）">
+      <input type="checkbox" value="${esc(value)}" ${hiddenHosts.has(value) ? "" : "checked"}><span class="sw"></span>${esc(name)}${mark}</label>`;
+  $("#hosts").innerHTML = hosts.length ? hostChip("", "このPC", "このPC のチャット") + hosts.map((h) => {
     const label = h.error ? "接続できません" : h.loading ? "読み込み中" : `${ago(h.fetched)}に取得`;
-    return `<span class="host ${h.error ? "err" : ""}" title="${esc(h.error || label)}">${esc(h.name)}${h.error ? " ✕" : h.loading ? " …" : ""}</span>`;
-  }).join("");
+    return hostChip(h.name, h.name, `${h.name}: ${h.error || label}`, h.error ? " ✕" : h.loading ? " …" : "", !!h.error);
+  }).join("") : "";
 }
 async function load() {
   try {
