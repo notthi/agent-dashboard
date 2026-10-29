@@ -96,7 +96,8 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 .actions [data-act="toggle"] { flex: 1 1 120px; }
 .actions [data-act="toggle"] + .spacer { flex: 0; }
 .job-wrap { position: relative; }
-.job-wrap .copy { position: absolute; top: 6px; right: 6px; background: var(--panel); }
+.job-wrap .job-btns { position: absolute; top: 6px; right: 6px; display: flex; gap: 4px; }
+.job-wrap .job-btns button { background: var(--panel); }
 .card { transition: border-color .15s, background .15s; }
 .actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0 0 16px; }
 button { font: inherit; font-size: 12px; color: var(--text); background: transparent;
@@ -314,6 +315,16 @@ const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, files: {}, 
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
 // 開いたカードでは「閉じる」を最後の吹き出しにだけ付ける（last）
+// ダッシュボードから送った結果の欄。返事がカードの「応答」に出たら二重になるので消す。
+// 終わってから 15 秒はメモ（Remote Control が外れた など）を読めるよう残し、カードに出ない結果も 60 秒で消す
+function shownJob(it, k) {
+  const j = ui.jobs[k];
+  if (!j || j.status === "running" || j.status === "error") return j;
+  const age = Date.now() / 1000 - (j.finished || j.started || 0);
+  const reflected = it.updated >= (j.finished || j.started || 0) - 1;
+  if ((reflected && age > 15) || age > 60) { delete ui.jobs[k]; return null; }
+  return j;
+}
 function msgRow(label, short, fullText, expanded, reply = false, last = false) {
   if (!short) return "";
   const kind = reply ? "reply" : "prompt";
@@ -368,7 +379,7 @@ function card(it) {
     ? (it.bridge_id ? `<span class="rc on" title="Remote Control オン">RC</span>` : `<span class="rc off" title="Remote Control オフ">RC オフ</span>`) : "";
   const open = ui.replyOpen.has(k);
   const full = ui.expanded.has(k);
-  const job = ui.jobs[k];
+  const job = shownJob(it, k);
   // 新しい指示への応答がまだのあいだは、前のターンの応答を隠してくるくるを出す。
   // 送った直後はアプリが記録に書くまで少しかかるので、送った文が指示として載り、応答待ちでなくなるまで待つ
   const w = ui.waiting[k];
@@ -416,7 +427,7 @@ function card(it) {
             ? `<button data-act="stopsend" title="アプリ側のチャットを止めて裏で送ります。返事はここに出ます（アプリには「中断」と出ます）">止めて送る</button>` : ""}<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
     </div>` : ""}
     ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? `<span class="spin"></span>実行中…` : linkify(esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました")))}</div>
-      ${job.status === "done" && job.output ? `<button class="copy" data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}</div>` : ""}
+      ${job.status !== "running" ? `<span class="job-btns">${job.status === "done" && job.output ? `<button data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}<button data-act="closejob" title="閉じる">×</button></span>` : ""}</div>` : ""}
   </div>`;
 }
 
@@ -507,6 +518,9 @@ document.addEventListener("click", (e) => {
     copyText(it.reply_full || it.reply);
   } else if (act === "copyjob") {
     copyText(ui.jobs[k]?.output || "");
+  } else if (act === "closejob") {
+    delete ui.jobs[k];
+    render();
   } else if (act === "toggle") {
     ui.replyOpen.has(k) ? ui.replyOpen.delete(k) : ui.replyOpen.add(k);
     render();
