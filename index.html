@@ -54,7 +54,6 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 .open .dot { background: var(--open); }
 .ask .dot { background: var(--ask); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ask) 25%, transparent); }
 .card.ask { border-color: var(--ask); }
-.msg.question { white-space: pre-wrap; -webkit-line-clamp: 6; }
 .col h2 .asking { margin-left: auto; font-size: 12px; font-weight: 500; color: var(--ask); }
 .col h2 .live + .asking { margin-left: 0; }
 @keyframes pulse { 50% { opacity: .45; } }
@@ -66,6 +65,25 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 /* 応答の高さは右上の「応答」で 2・5・10 行から選ぶ。5行以上は改行を残した全文を切り詰めて出す */
 .msg.reply { -webkit-line-clamp: var(--rows, 2); }
 .msg.reply.long { white-space: pre-wrap; }
+/* 指示は右、応答は左の吹き出しにして、チャットのように読めるようにする。ラベルは読み上げ用に残して画面からは隠す */
+.msg.prompt, .msg.reply, .msg.question { display: block; -webkit-line-clamp: unset; width: fit-content; max-width: 88%;
+  padding: 5px 10px; line-height: 1.55; }
+/* 行数の切り詰めは中の文に掛ける（吹き出しの余白に次の行がのぞかないように） */
+.msg .t { display: -webkit-box; -webkit-box-orient: vertical; overflow: hidden; -webkit-line-clamp: 2; }
+.msg.reply .t { -webkit-line-clamp: var(--rows, 2); }
+.msg.question .t { -webkit-line-clamp: 6; white-space: pre-wrap; }
+.msg.full .t { display: block; -webkit-line-clamp: unset; }
+.msg.question { margin: 6px 0 0 16px; border-radius: 12px 12px 12px 3px; border: 1.5px solid var(--ask);
+  background: color-mix(in srgb, var(--ask) 10%, var(--panel)); }
+.msg.prompt { margin: 8px 0 0 auto; border-radius: 12px 12px 3px 12px;
+  background: color-mix(in srgb, var(--c) 16%, var(--panel)); }
+.msg.reply { margin: 6px 0 0 16px; border-radius: 12px 12px 12px 3px; background: var(--bg); border: 1px solid var(--line); }
+.msg.prompt.full, .msg.reply.full { max-width: 100%; }
+/* 切り詰めた文のすぐ下に出す「さらに表示」（X のような文中リンク） */
+.msg .more { display: inline; border: 0; padding: 0; background: none; font-size: 13px; color: var(--c);
+  cursor: pointer; margin-top: 2px; }
+.msg .more:hover { text-decoration: underline; color: var(--c); }
+.msg.prompt > b, .msg.reply > b, .msg.question > b { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
 .msg a, .job a { color: var(--c); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
 .msg.full { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; max-height: 420px; overflow: auto;
   cursor: text; user-select: text; }
@@ -215,12 +233,24 @@ const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: n
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
-function msgRow(label, short, fullText, expanded, reply = false) {
+// 開いたカードでは「閉じる」を最後の吹き出しにだけ付ける（last）
+function msgRow(label, short, fullText, expanded, reply = false, last = false) {
   if (!short) return "";
-  if (expanded && fullText) return `<div class="msg full"><b>${label}</b>${linkify(esc(fullText))}</div>`;
-  if (reply && fullText && +$("#rows").value > 2)
-    return `<div class="msg reply long"><b>${label}</b>${linkify(esc(fullText))}</div>`;
-  return `<div class="msg${reply ? " reply" : ""}"><b>${label}</b>${linkify(esc(short))}</div>`;
+  const kind = reply ? "reply" : "prompt";
+  const text = linkify(esc(fullText || short));
+  if (expanded) return `<div class="msg ${kind} full"><b>${label}</b><div class="t">${text}</div>${
+    last ? `<button class="more" data-act="expand">閉じる</button>` : ""}</div>`;
+  // 「さらに表示」はいったん全部に付け、実際に切れていない文からは描画のあと pruneMore() で外す
+  const more = `<button class="more" data-act="expand">さらに表示</button>`;
+  if (reply && fullText && +$("#rows").value > 2) return `<div class="msg reply long"><b>${label}</b><div class="t">${text}</div>${more}</div>`;
+  return `<div class="msg ${kind}"><b>${label}</b><div class="t">${linkify(esc(short))}</div>${more}</div>`;
+}
+// 行数に収まっていて、短い版でも切っていない（末尾が「…」でない）文からは「さらに表示」を外す
+function pruneMore() {
+  document.querySelectorAll(".msg:not(.full) .more").forEach((b) => {
+    const t = b.previousElementSibling;
+    if (t.scrollHeight <= t.clientHeight + 1 && !t.textContent.endsWith("…")) b.remove();
+  });
 }
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); return toast("コピーしました"); } catch {}
@@ -247,14 +277,13 @@ function card(it) {
     <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}</div>
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
-    ${it.question ? `<div class="msg question"><b>質問</b>${esc(it.question)}</div>` : ""}
-    ${msgRow("指示", it.prompt, it.prompt_full, full)}
-    ${msgRow("応答", it.reply, it.reply_full, full, true)}
+    ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
+    ${msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply)}
+    ${msgRow("応答", it.reply, it.reply_full, full, true, true)}
     <div class="actions">
       <button data-act="open" ${it.host && !it.bridge_id ? `disabled title="${esc(it.host)} のセッションは、そのマシンで開いてください"` : ""}>${openLabel(it)}</button>
       <button data-act="toggle" ${it.can_reply ? "" : `disabled title="${esc(it.no_reply || NO_REPLY[it.tool])}"`}>返信</button>
       <span class="spacer"></span>
-      ${it.prompt_full || it.reply_full ? `<button data-act="expand">${full ? "たたむ" : "全文"}</button>` : ""}
       ${it.reply ? `<button data-act="copy" title="応答の全文をコピー">応答をコピー</button>` : ""}
     </div>
     ${open ? `<div class="reply-box">
@@ -500,6 +529,7 @@ function render() {
   $("#main").innerHTML = shown.length
     ? shown.map((t) => column(t, last)).join("")
     : `<div class="empty">表示する列がありません。右上で選んでください</div>`;
+  pruneMore();
   document.querySelectorAll("details").forEach((d, i) => (d.open = !!open[i]));
   scrolls.forEach(([k, cls, top]) => {
     const el = k && document.querySelector(`.card[data-key="${CSS.escape(k)}"] .${cls.trim().split(/\s+/).join(".")}`);
