@@ -63,6 +63,9 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 .meta { color: var(--muted); font-size: 12px; margin: 2px 0 0 16px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .msg { margin: 6px 0 0 16px; font-size: 13px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
 .msg b { color: var(--muted); font-weight: 500; margin-right: 4px; }
+/* 応答の高さは右上の「応答」で 2・5・10 行から選ぶ。5行以上は改行を残した全文を切り詰めて出す */
+.msg.reply { -webkit-line-clamp: var(--rows, 2); }
+.msg.reply.long { white-space: pre-wrap; }
 .msg a, .job a { color: var(--c); text-decoration: underline; text-underline-offset: 2px; word-break: break-all; }
 .msg.full { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; max-height: 420px; overflow: auto;
   cursor: text; user-select: text; }
@@ -128,6 +131,9 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
       <option value="1">24時間</option><option value="3" selected>3日</option>
       <option value="7">7日</option><option value="30">30日</option>
     </select></label>
+    <label>応答 <select id="rows" title="カードに出す応答の行数">
+      <option value="2">小</option><option value="5">中</option><option value="10">大</option>
+    </select></label>
     <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
     <span id="hosts"></span>
     <span id="updated"></span>
@@ -155,6 +161,7 @@ let hiddenCols = new Set();
 try {
   $("#days").value = localStorage.getItem("days") || "3";
   $("#showAuto").checked = localStorage.getItem("showAuto") === "1";
+  $("#rows").value = localStorage.getItem("rows") || "2";
   hiddenCols = new Set(JSON.parse(localStorage.getItem("hiddenCols") || "[]"));
 } catch {}
 $("#cols").innerHTML = TOOLS.map(([k, name, color]) =>
@@ -208,11 +215,12 @@ const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: n
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
-function msgRow(label, short, fullText, expanded) {
+function msgRow(label, short, fullText, expanded, reply = false) {
   if (!short) return "";
-  return expanded && fullText
-    ? `<div class="msg full"><b>${label}</b>${linkify(esc(fullText))}</div>`
-    : `<div class="msg"><b>${label}</b>${linkify(esc(short))}</div>`;
+  if (expanded && fullText) return `<div class="msg full"><b>${label}</b>${linkify(esc(fullText))}</div>`;
+  if (reply && fullText && +$("#rows").value > 2)
+    return `<div class="msg reply long"><b>${label}</b>${linkify(esc(fullText))}</div>`;
+  return `<div class="msg${reply ? " reply" : ""}"><b>${label}</b>${linkify(esc(short))}</div>`;
 }
 async function copyText(text) {
   try { await navigator.clipboard.writeText(text); return toast("コピーしました"); } catch {}
@@ -241,7 +249,7 @@ function card(it) {
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
     ${it.question ? `<div class="msg question"><b>質問</b>${esc(it.question)}</div>` : ""}
     ${msgRow("指示", it.prompt, it.prompt_full, full)}
-    ${msgRow("応答", it.reply, it.reply_full, full)}
+    ${msgRow("応答", it.reply, it.reply_full, full, true)}
     <div class="actions">
       <button data-act="open" ${it.host && !it.bridge_id ? `disabled title="${esc(it.host)} のセッションは、そのマシンで開いてください"` : ""}>${openLabel(it)}</button>
       <button data-act="toggle" ${it.can_reply ? "" : `disabled title="${esc(it.no_reply || NO_REPLY[it.tool])}"`}>返信</button>
@@ -519,6 +527,9 @@ async function load() {
   }
 }
 $("#days").onchange = () => { try { localStorage.setItem("days", $("#days").value); } catch {} load(); };
+const applyRows = () => document.documentElement.style.setProperty("--rows", $("#rows").value);
+applyRows();
+$("#rows").onchange = () => { try { localStorage.setItem("rows", $("#rows").value); } catch {} applyRows(); render(); };
 $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#showAuto").checked ? "1" : "0"); } catch {} render(); };
 load();
 // 見ていない間（ほかのタブやウインドウの裏）は更新しない。電池と通信の節約。戻ってきたらすぐ更新する
