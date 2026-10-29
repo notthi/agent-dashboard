@@ -37,6 +37,9 @@ h1 { font-size: 17px; margin: 0; font-weight: 650; }
 .controls > label { display: inline-flex; align-items: center; gap: 4px; height: 24px; }
 select, input { font: inherit; }
 select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 0 4px; height: 24px; }
+#q { height: 24px; width: 200px; padding: 0 8px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel);
+  color: var(--text); font-size: 12px; }
+#q:focus { outline: none; border-color: var(--muted); }
 #updated { font-variant-numeric: tabular-nums; }
 main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr)); gap: 16px; padding: 16px 20px 40px; }
 @media (max-width: 900px) { main { grid-template-columns: 1fr; padding: 12px 16px 40px; } header { padding: 12px 16px; } }
@@ -89,6 +92,9 @@ main { display: grid; grid-template-columns: repeat(var(--n, 3), minmax(0, 1fr))
 .msg.full { display: block; -webkit-line-clamp: unset; white-space: pre-wrap; max-height: 420px; overflow: auto;
   cursor: text; user-select: text; }
 .actions .spacer { flex: 1; }
+/* 返信は押しやすいように、開くボタンとコピーのあいだを横いっぱいに使う */
+.actions [data-act="toggle"] { flex: 1 1 120px; }
+.actions [data-act="toggle"] + .spacer { flex: 0; }
 .job-wrap { position: relative; }
 .job-wrap .copy { position: absolute; top: 6px; right: 6px; background: var(--panel); }
 .card { transition: border-color .15s, background .15s; }
@@ -188,6 +194,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
   <h1>Agent Dashboard</h1>
   <div id="rings"></div>
   <div class="controls">
+    <input type="search" id="q" placeholder="キーワードで絞り込み" title="題名・最後の指示と応答・フォルダ・端末名から探します（スペース区切りはすべて含むもの）">
     <div class="cols" id="cols"></div>
     <span id="hosts"></span>
     <label>期間 <select id="days">
@@ -587,6 +594,15 @@ document.addEventListener("click", async (e) => {
   try { await post("/api/open", { tool: "muse" }); toast("Muse を開きました"); }
   catch (err) { toast(err.message); }
 });
+const query = () => $("#q").value.toLowerCase().split(/\s+/).filter(Boolean);
+function matchQuery(it) {
+  const words = query();
+  if (!words.length) return true;
+  const hay = [it.title, it.prompt, it.prompt_full, it.reply, it.reply_full, it.question, it.cwd, it.host, it.model]
+    .filter(Boolean).join(" ").toLowerCase();
+  return words.every((w) => hay.includes(w));
+}
+$("#q").addEventListener("input", () => render());
 function column([key, name, color], data) {
   if (key === "muse") return museColumn(name, color);
   const t = data.tools[key] || { items: [] };
@@ -594,12 +610,14 @@ function column([key, name, color], data) {
   const all = t.items.filter((i) => !hiddenHosts.has(i.host || ""));
   const items = all.filter((i) => showAuto || !i.auto);
   const hidden = all.length - items.length;
+  // キーワードは画面が持っている分（題名・最後の指示と応答など）から探すだけなので、サーバーの負担は増えない
+  const hits = items.filter(matchQuery);
   // 状態で分けず、更新の新しい順に1本で並べる（開いている／終わったの色の違いが分かりにくいため）
-  const sorted = [...items].sort((a, b) => b.updated - a.updated);
+  const sorted = [...hits].sort((a, b) => b.updated - a.updated);
   const busy = items.filter((i) => i.state === "busy").length;
   const asking = items.filter((i) => i.state === "ask").length;
   let html = `<section class="col" style="--c:${color}">
-    <h2><span class="swatch"></span>${name}<span class="count">${items.length}件</span>
+    <h2><span class="swatch"></span>${name}<span class="count">${query().length ? `${hits.length} / ${items.length}件` : `${items.length}件`}</span>
     ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}${asking ? `<span class="asking">● ${asking} 質問あり</span>` : ""}
     ${NEW_TOOLS.includes(key) ? `<button class="new-btn" data-new="${key}" title="この列の道具で新しいチャットを始める">＋ 新規</button>` : ""}</h2>`
     + usage(key, t, items) + (ui.newOpen.has(key) ? newBox(key, t) : "");
@@ -608,6 +626,7 @@ function column([key, name, color], data) {
   html += head.map(card).join("");
   if (tail.length) html += `<details><summary>さらに ${tail.length} 件</summary>${tail.map(card).join("")}</details>`;
   if (!items.length) html += `<div class="empty">この期間のセッションはありません</div>`;
+  else if (!hits.length) html += `<div class="empty">「${esc($("#q").value.trim())}」に当てはまるチャットはありません</div>`;
   if (hidden) html += `<div class="empty">自動実行 ${hidden} 件を非表示</div>`;
   return html + `</section>`;
 }
