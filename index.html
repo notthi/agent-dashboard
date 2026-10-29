@@ -23,6 +23,16 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px;
   padding: 16px 20px; border-bottom: 1px solid var(--line); position: sticky; top: 0;
   background: var(--bg); z-index: 2; }
 h1 { font-size: 17px; margin: 0; font-weight: 650; }
+/* ヘッダーに常に出しておく使用量の円 */
+#rings { display: flex; gap: 14px; align-items: center; }
+.ring-group { display: flex; gap: 6px; align-items: center; }
+.ring { display: flex; flex-direction: column; align-items: center; gap: 1px; font-size: 10px; color: var(--muted); line-height: 1; }
+.ring .dial { position: relative; width: 32px; height: 32px; }
+.ring svg { transform: rotate(-90deg); display: block; }
+.ring .dial b { position: absolute; inset: 0; display: grid; place-items: center; font-size: 10px; font-weight: 600;
+  color: var(--text); font-variant-numeric: tabular-nums; }
+.ring.warn { --c: var(--busy) !important; }
+.ring.full { --c: #c0392b !important; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; margin-left: auto; color: var(--muted); font-size: 13px; }
 select, input { font: inherit; }
 select { background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 6px; padding: 2px 6px; }
@@ -111,6 +121,7 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
 <body>
 <header>
   <h1>Agent Dashboard</h1>
+  <div id="rings"></div>
   <div class="controls">
     <div class="cols" id="cols"></div>
     <label>期間 <select id="days">
@@ -368,18 +379,28 @@ document.addEventListener("input", (e) => {
   if (e.target.matches(".reply-box textarea")) ui.drafts[e.target.closest(".card").dataset.key] = e.target.value;
 });
 document.addEventListener("keydown", (e) => {
+  // Tab で「送信」ボタンへ移り、そのまま Enter で送れるようにする（並び順のままだと「やめる」に止まる）
+  if (e.target.matches(".reply-box textarea") && e.key === "Tab" && !e.shiftKey && !e.isComposing) {
+    const btn = e.target.closest(".reply-box").querySelector("button.primary");
+    if (btn) { e.preventDefault(); btn.focus(); }
+    return;
+  }
   if (e.target.matches(".reply-box textarea") && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
     const k = e.target.closest(".card").dataset.key, it = findItem(k);
     sendReply(it, k, stopDefault(it));
   }
 });
 const DAYS_LABEL = { 1: "24時間", 3: "3日", 7: "7日", 30: "30日" };
-function limitRow(label, l) {
-  if (!l) return "";
+// リセット時刻を過ぎた記録は古いので 0% とみなす
+function limitState(l) {
   const reset = l.resets_at * 1000;
-  // リセット時刻を過ぎた記録は古いので 0% とみなす
   const pct = reset < Date.now() ? 0 : l.used_percent;
   const when = reset < Date.now() ? "リセット済み" : `${new Date(reset).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })} にリセット`;
+  return { pct, when };
+}
+function limitRow(label, l) {
+  if (!l) return "";
+  const { pct, when } = limitState(l);
   return `<div class="limit">${label}<span class="bar"><i style="width:${Math.min(100, pct)}%"></i></span><b>${pct}%</b><span>${when}</span></div>`;
 }
 function usage(key, t, items) {
@@ -395,6 +416,24 @@ function usage(key, t, items) {
   if (t.limits) html += limitRow("5時間枠", t.limits.primary) + limitRow("週の枠", t.limits.secondary);
   else if (key === "claude") html += `<div>5時間枠・週の枠を取得中…</div>`;
   return html + `</div>`;
+}
+// 5時間枠と週の枠を、ヘッダーの小さな円で常に見せる（80% で黄、95% で赤）
+function ring(label, l, color, tool) {
+  if (!l) return "";
+  const { pct, when } = limitState(l);
+  const r = 13, c = 2 * Math.PI * r, v = Math.min(100, Math.max(0, pct));
+  const cls = v >= 95 ? "full" : v >= 80 ? "warn" : "";
+  return `<div class="ring ${cls}" style="--c:${color}" title="${tool} ${label}: ${pct}%（${when}）">
+    <div class="dial"><svg width="32" height="32" viewBox="0 0 32 32">
+      <circle cx="16" cy="16" r="${r}" fill="none" stroke="var(--line)" stroke-width="3.5"/>
+      <circle cx="16" cy="16" r="${r}" fill="none" stroke="var(--c)" stroke-width="3.5" stroke-linecap="round"
+        stroke-dasharray="${(c * v / 100).toFixed(2)} ${c.toFixed(2)}"/></svg><b>${pct}</b></div>${label}</div>`;
+}
+function rings(data) {
+  return TOOLS.filter(([k]) => data.tools[k]?.limits).map(([k, name, color]) => {
+    const l = data.tools[k].limits;
+    return `<div class="ring-group" title="${name}">${ring("5h", l.primary, color, name)}${ring("1W", l.secondary, color, name)}</div>`;
+  }).join("");
 }
 // Muse は会話がパソコンに残らないので、一覧ではなくアプリの呼び出し口だけ
 // アプリは Mac 版のみ。Windows ではサーバー側が Web 版を開く（ダッシュボードは localhost で見るので UA で判断できる）
@@ -459,6 +498,7 @@ function render() {
     if (el) el.scrollTop = top;
   });
   $("#updated").textContent = "更新 " + new Date(last.generated * 1000).toLocaleTimeString();
+  $("#rings").innerHTML = rings(last);
   // hosts.json に書いたマシンごとの接続状態
   $("#hosts").innerHTML = (last.hosts || []).map((h) => {
     const label = h.error ? "接続できません" : h.loading ? "読み込み中" : `${ago(h.fetched)}に取得`;
@@ -472,7 +512,8 @@ async function load() {
     // 入力中に描き直すとカーソルが飛ぶので、入力欄にフォーカスがある間は保留
     // 文字を選んでいる間も、選択が消えないよう保留
     const selecting = String(window.getSelection?.() || "").length > 0;
-    if (!document.activeElement?.matches(".reply-box textarea") && !selecting) render();
+    // Tab で「送信」ボタンに移ったあとも、Enter を押すまでフォーカスが消えないよう保留
+    if (!document.activeElement?.closest(".reply-box") && !selecting) render();
   } catch (e) {
     $("#updated").textContent = "サーバーに接続できません";
   }
