@@ -96,6 +96,25 @@ def now():
     return time.time()
 
 
+def head_cwd(path, nbytes=2_000_000):
+    """履歴の先頭から、最初に記録された作業フォルダを探す"""
+    try:
+        with open(path, "rb") as f:
+            data = f.read(nbytes)
+    except OSError:
+        return None
+    for raw in data.split(b"\n"):
+        if b'"cwd"' not in raw:
+            continue
+        try:
+            cwd = json.loads(raw).get("cwd")
+        except ValueError:
+            continue
+        if cwd:
+            return cwd
+    return None
+
+
 def tail_lines(path, nbytes=TAIL_BYTES):
     try:
         with open(path, "rb") as f:
@@ -226,6 +245,84 @@ def claude_live():
             continue
         live[d.get("sessionId")] = d
     return live
+
+
+# ---------------------------------------------------------------- Remote Control の記録
+# 起動中のチャットの Remote Control（bridgeSessionId）が付いたり外れたりした時刻を残す。
+# 切れる原因を、そのとき何をしていたか（送信・スリープ・起動し直し）と突き合わせて探すため
+RC_LOG_FILE = CACHE_DIR / "rc_log.jsonl"
+RC_SEEN = {}  # sessionId -> {"bridge", "name", "pid"}
+RC_INTERVAL = 15  # 秒。session ファイルを読むだけなので軽い
+
+
+def rc_record(event, sid, info):
+    row = {"ts": now(), "event": event, "id": sid, "name": info.get("name") or sid[:8],
+           "bridge": (info.get("bridge") or "")[-6:], "status": info.get("status")}
+    try:
+        RC_LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(RC_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def rc_check(first=False):
+    cur = {sid: {"bridge": lv.get("bridgeSessionId"), "name": lv.get("name"), "pid": lv.get("pid"),
+                 "status": lv.get("status")} for sid, lv in claude_live().items()
+           # claude -p（/usage の取得やダッシュボードからの返信）は Remote Control と関係ないので数えない
+           if sid and lv.get("kind", "interactive") == "interactive"}
+    if not first:
+        for sid, info in cur.items():
+            prev = RC_SEEN.get(sid)
+            if prev is None or prev["pid"] != info["pid"]:
+                rc_record("start-on" if info["bridge"] else "start-off", sid, info)  # 起動・開き直し
+            elif prev["bridge"] and not info["bridge"]:
+                rc_record("off", sid, info)
+            elif info["bridge"] and info["bridge"] != prev["bridge"]:
+                rc_record("on", sid, info)
+        for sid, prev in RC_SEEN.items():
+            if sid not in cur:
+                rc_record("end", sid, prev)  # プロセスが終わった（閉じた・止めた・落ちた）
+    RC_SEEN.clear()
+    RC_SEEN.update(cur)
+
+
+def rc_watch():
+    first = True
+    while True:
+        try:
+            rc_check(first)
+            first = False
+        except Exception:  # noqa: BLE001  記録が失敗しても本体は止めない
+            pass
+        time.sleep(RC_INTERVAL)
+
+
+def rc_log(limit=200):
+    try:
+        lines = RC_LOG_FILE.read_text(encoding="utf-8").splitlines()[-limit:]
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            out.append(json.loads(line))
+        except ValueError:
+            continue
+    return out
+
+
+def rc_log_all(limit=200):
+    """このPCと、Tailscale でつながった端末の記録をまとめて新しい順に返す"""
+    rows = [dict(r, host=None) for r in rc_log(limit)]
+    for host in ts_hosts():
+        if REMOTE.get(host["name"], {}).get("data") is None:
+            continue  # ダッシュボードが応答していない端末は聞かない
+        try:
+            rows += [dict(r, host=host["name"]) for r in ts_get(host["ts"], f"/share/rclog?limit={limit}").get("events", [])]
+        except (OSError, ValueError):
+            pass
+    return sorted(rows, key=lambda r: -r.get("ts", 0))[:limit]
 
 
 _USAGE_CACHE = {}  # path -> ((size, mtime), 結果)。履歴は追記だけなので変わったものだけ読み直す
@@ -411,7 +508,9 @@ def collect_claude(since):
             if updated < since and state != "busy":
                 continue  # 中身が書き足されただけの古いチャットは、期間の一覧に出さない
         if cwd is None:
-            cwd = "/" + f.parent.name.lstrip("-").replace("-", "/")
+            # 末尾だけでは作業フォルダが分からない（大きな履歴）ときは、先頭から探す。
+            # フォルダ名から推すと日本語が「-」に化けて存在しないパスになり、返信が別のフォルダで動いてしまう
+            cwd = cached_by_stat(str(f), head_cwd) or "/" + f.parent.name.lstrip("-").replace("-", "/")
         usage = cached_by_stat(str(f), claude_usage) or {}
         items[sid] = {
             "model": usage.get("model"),
@@ -1444,6 +1543,8 @@ class ShareHandler(BaseHTTPRequestHandler):
         q = parse_qs(url.query)
         if url.path == "/share/sessions":
             self.send_shared(snapshot(float(q.get("days", ["3"])[0]), with_remote=False))
+        elif url.path == "/share/rclog":
+            self.send_json({"events": rc_log(min(500, int(q.get("limit", ["200"])[0])))})
         elif url.path == "/share/job":
             job = JOBS.get(q.get("id", [""])[0])
             self.send_json(job or {"error": "not found"}, 200 if job else 404)
@@ -1522,6 +1623,9 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/api/job":
             job = JOBS.get(q.get("id", [""])[0])
             self.send_json(job or {"error": "not found"}, 200 if job else 404)
+            return
+        if url.path == "/api/rclog":
+            self.send_json({"events": rc_log_all()})
             return
         if url.path not in ("/", "/index.html"):
             self.send_error(404)
@@ -1632,6 +1736,7 @@ if __name__ == "__main__":
               f"\n別ポートで起動: PORT=8766 python3 {sys.argv[0]}")
         sys.exit(1)
     print(f"Agent dashboard: http://localhost:{PORT}", flush=True)
+    threading.Thread(target=rc_watch, daemon=True).start()
     if "--share" in sys.argv:
         start_share_server()
     srv.serve_forever()

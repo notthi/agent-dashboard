@@ -105,6 +105,20 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .reply-box textarea:focus { outline: none; border-color: var(--c); }
 .reply-box .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
 .reply-box .hint { color: var(--muted); font-size: 11px; margin-right: auto; }
+/* Remote Control の状態（起動中の Claude のチャットだけ）と、付いたり外れたりした記録 */
+.rc { display: inline-block; font-size: 10px; line-height: 15px; padding: 0 5px; margin-left: 6px; border-radius: 4px;
+  border: 1px solid currentColor; vertical-align: 1px; }
+.rc.on { color: var(--open); }
+.rc.off { color: #c0392b; }
+#rclog { position: fixed; top: 64px; right: 16px; width: min(560px, calc(100vw - 32px)); max-height: 70vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; z-index: 5;
+  box-shadow: 0 8px 24px rgba(0,0,0,.25); font-size: 12px; }
+#rclog[hidden] { display: none; }
+#rclog table { width: 100%; border-collapse: collapse; }
+#rclog td { padding: 3px 6px; border-top: 1px solid var(--line); white-space: nowrap; }
+#rclog td.name { white-space: normal; }
+#rclog .ev-off, #rclog .ev-end { color: #c0392b; }
+#rclog .ev-on, #rclog .ev-start-on { color: var(--open); }
 /* 列の見出しの「＋ 新規」と、新しいチャットの入力欄 */
 .col h2 { flex-wrap: wrap; row-gap: 4px; }
 .col h2 .count, .col h2 .live, .col h2 .asking { white-space: nowrap; }
@@ -169,10 +183,12 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
       <option value="2">小</option><option value="5">中</option><option value="10">大</option>
     </select></label>
     <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
+    <button id="rcbtn" title="Remote Control が付いたり外れたりした記録">RC記録</button>
     <span id="updated"></span>
   </div>
 </header>
 <main id="main"></main>
+<div id="rclog" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
 const TOOLS = [
@@ -291,13 +307,16 @@ function card(it) {
   const k = key(it);
   const st = STATE_LABEL[it.state] ? ` · ${STATE_LABEL[it.state]}` : "";
   const via = it.via ? ` · ${esc(it.via)}` : "";
+  // 起動中の Claude のチャットは、Remote Control が付いているかを出す（スマホや claude.ai から続けられるか）
+  const rc = it.tool === "claude" && it.live
+    ? (it.bridge_id ? `<span class="rc on" title="Remote Control オン">RC</span>` : `<span class="rc off" title="Remote Control オフ">RC オフ</span>`) : "";
   const open = ui.replyOpen.has(k);
   const full = ui.expanded.has(k);
   const job = ui.jobs[k];
   return `<div class="card ${it.state}" data-key="${esc(k)}">
     <div class="top"><span class="dot"></span><span class="title">${esc(it.title)}</span>
       <span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
-    <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}</div>
+    <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}${rc}</div>
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
     ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
@@ -604,6 +623,28 @@ document.addEventListener("change", (e) => {
   f.host = e.target.value; delete f.cwd;
   render();
 });
+
+// Remote Control の記録。開いている間は 15 秒ごとに読み直す
+const RC_EVENT = { "on": "オンになった", "off": "オフになった", "start-on": "起動（オン）", "start-off": "起動（オフ）", "end": "終了" };
+async function loadRcLog() {
+  const box = $("#rclog");
+  if (box.hidden) return;
+  try {
+    const { events } = await fetch("/api/rclog").then((r) => r.json());
+    box.innerHTML = `<b>Remote Control の記録</b>（新しい順・この画面を開いていないときも 15 秒ごとに記録）
+      <table>${(events || []).map((e) => `<tr class="ev-${esc(e.event)}">
+        <td>${new Date(e.ts * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</td>
+        <td>${esc(e.host || "このPC")}</td><td class="name">${esc(e.name)}</td><td>${esc(RC_EVENT[e.event] || e.event)}</td>
+        <td>${esc(e.status || "")}</td></tr>`).join("") || `<tr><td>まだ記録がありません</td></tr>`}</table>`;
+  } catch { box.textContent = "記録を読めませんでした"; }
+}
+$("#rcbtn").onclick = () => {
+  const box = $("#rclog");
+  box.hidden = !box.hidden;
+  box.style.top = `${document.querySelector("header").getBoundingClientRect().bottom + 6}px`;  // 折り返したヘッダーの下に出す
+  loadRcLog();
+};
+setInterval(loadRcLog, 15000);
 
 let last = null;
 function render() {
