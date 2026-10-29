@@ -490,6 +490,7 @@ DESKTOP_SESSIONS = CLAUDE_APP_DIR / "claude-code-sessions"
 
 
 DESKTOP_TITLES = {}  # CLI のセッション ID -> アプリでの題名。貼り付け前に、画面のチャットと照らし合わせる
+DESKTOP_PERMS = {}  # CLI のセッション ID -> アプリでそのチャットに設定している許可モード（auto など）
 
 
 def claude_desktop_ids():
@@ -503,6 +504,7 @@ def claude_desktop_ids():
         if d.get("cliSessionId") and not d.get("isArchived"):
             ids[d["cliSessionId"]] = d.get("sessionId") or f.stem
             DESKTOP_TITLES[d["cliSessionId"]] = d.get("title") or ""
+            DESKTOP_PERMS[d["cliSessionId"]] = d.get("permissionMode")
     return ids
 
 
@@ -628,6 +630,8 @@ def collect_claude(since):
             "via": (lv or {}).get("entrypoint") or entry or "",
             "live": lv is not None,
             "desktop_id": (lv or {}).get("hostSessionId") or desktop.get(sid),
+            # ダッシュボードから送るときも、アプリでのこのチャットの許可モードで動かす
+            "permission_mode": DESKTOP_PERMS.get(sid),
             # Remote Control で claude.ai からも操作できるセッションの ID（別マシンから開く・返信するのに使う）
             "bridge_id": (lv or {}).get("bridgeSessionId"),
             # 開いているセッションへ CLI から書き込むと履歴が分岐するので、
@@ -1381,13 +1385,25 @@ def with_image_paths(text, paths):
     return text + "\n\n添付画像（このファイルを読んで確認してください）:\n" + "\n".join(paths)
 
 
+# 確認を出せない -p でも、アプリで設定した許可モードなら同じ判断で動く（既定のままだと確認の要る操作が全部止まる）。
+# 確認なしで何でも通す bypassPermissions は、別マシンからも送れるダッシュボードでは auto に抑える
+CLAUDE_MODES = {"auto", "acceptEdits", "plan", "manual", "dontAsk"}
+
+
+def claude_mode_args(item):
+    mode = item.get("permission_mode")
+    if mode == "bypassPermissions":
+        mode = "auto"
+    return ["--permission-mode", mode] if mode in CLAUDE_MODES else []
+
+
 def reply_command(item, text, images=()):
     """(argv, stdin) を返す。本文はシェルを通さず渡す"""
     tool, sid = item["tool"], item["id"]
     if tool == "claude":
         # 作業フォルダ外の画像も確認なしで読めるよう、保存先を許可フォルダに足す
         extra = ["--add-dir", str(UPLOAD_DIR)] if images or str(UPLOAD_DIR) in text else []
-        return ["claude", "-p", "--resume", sid, *extra], with_image_paths(text, images)
+        return ["claude", "-p", "--resume", sid, *claude_mode_args(item), *extra], with_image_paths(text, images)
     if tool == "codex":
         # `codex queue` は次にスレッドを開くまで実行されないので、その場で続きを実行する
         flags = [a for p in images for a in ("-i", p)]
