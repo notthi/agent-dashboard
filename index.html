@@ -105,6 +105,17 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .reply-box textarea:focus { outline: none; border-color: var(--c); }
 .reply-box .row { display: flex; gap: 8px; align-items: center; margin-top: 6px; }
 .reply-box .hint { color: var(--muted); font-size: 11px; margin-right: auto; }
+/* 列の見出しの「＋ 新規」と、新しいチャットの入力欄 */
+.col h2 { flex-wrap: wrap; row-gap: 4px; }
+.col h2 .count, .col h2 .live, .col h2 .asking { white-space: nowrap; }
+.col h2 .new-btn { font-size: 12px; font-weight: 500; padding: 1px 8px; margin-left: auto; }
+.col h2 .live ~ .new-btn, .col h2 .asking ~ .new-btn { margin-left: 8px; }
+.new-box { margin: 0 0 12px; padding: 10px; border: 1px solid var(--c); border-radius: 8px; background: var(--panel); }
+.new-box .fields { display: grid; grid-template-columns: auto 1fr; gap: 6px 8px; align-items: center; margin-bottom: 6px;
+  font-size: 12px; color: var(--muted); }
+.new-box input[type=text], .new-box select { font: inherit; font-size: 12px; color: var(--text); background: var(--bg);
+  border: 1px solid var(--line); border-radius: 6px; height: 26px; padding: 0 6px; min-width: 0; }
+.new-box .job { margin-left: 0; }
 .job { margin: 8px 0 0 16px; font-size: 13px; padding: 6px 8px; border-radius: 6px;
   background: var(--bg); border: 1px dashed var(--line); white-space: pre-wrap; word-break: break-word;
   max-height: 220px; overflow: auto; cursor: text; }
@@ -240,7 +251,8 @@ const NO_REPLY = {
   antigravity: "実行中です",
 };
 // 再描画（5秒ごと）をまたいで残す UI 状態
-const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set() };
+const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set(),
+  newOpen: new Set(), newForm: {} };  // newForm[道具] = { host, cwd, text }
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
@@ -394,7 +406,7 @@ document.addEventListener("click", (e) => {
 });
 document.addEventListener("click", (e) => {
   const btn = e.target.closest(".reply-box button");
-  if (!btn) return;
+  if (!btn || btn.closest(".new-box")) return;
   const k = btn.closest(".card").dataset.key;
   if (btn.dataset.act === "cancel") { ui.replyOpen.delete(k); render(); }
   if (btn.dataset.act === "send") sendReply(findItem(k), k);
@@ -404,7 +416,7 @@ document.addEventListener("click", (e) => {
 // 入力欄に画像を貼り付けると添付になる
 document.addEventListener("paste", (e) => {
   const ta = e.target.closest?.(".reply-box textarea");
-  if (!ta) return;
+  if (!ta || ta.closest(".new-box")) return;
   const files = [...(e.clipboardData?.files || [])].filter((f) => f.type.startsWith("image/"));
   if (!files.length) return;
   e.preventDefault();
@@ -424,6 +436,8 @@ document.addEventListener("paste", (e) => {
   });
 });
 document.addEventListener("input", (e) => {
+  const nb = e.target.closest?.(".new-box");
+  if (nb) { (ui.newForm[nb.dataset.tool] ||= {})[e.target.name] = e.target.value; return; }
   if (e.target.matches(".reply-box textarea")) ui.drafts[e.target.closest(".card").dataset.key] = e.target.value;
 });
 document.addEventListener("keydown", (e) => {
@@ -431,6 +445,10 @@ document.addEventListener("keydown", (e) => {
   if (e.target.matches(".reply-box textarea") && e.key === "Tab" && !e.shiftKey && !e.isComposing) {
     const btn = e.target.closest(".reply-box").querySelector("button.primary");
     if (btn) { e.preventDefault(); btn.focus(); }
+    return;
+  }
+  if (e.target.matches(".new-box textarea") && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    sendNew(e.target.closest(".new-box").dataset.tool);
     return;
   }
   if (e.target.matches(".reply-box textarea") && e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -514,7 +532,9 @@ function column([key, name, color], data) {
   const asking = items.filter((i) => i.state === "ask").length;
   let html = `<section class="col" style="--c:${color}">
     <h2><span class="swatch"></span>${name}<span class="count">${items.length}件</span>
-    ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}${asking ? `<span class="asking">● ${asking} 質問あり</span>` : ""}</h2>` + usage(key, t, items);
+    ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}${asking ? `<span class="asking">● ${asking} 質問あり</span>` : ""}
+    ${NEW_TOOLS.includes(key) ? `<button class="new-btn" data-new="${key}" title="この列の道具で新しいチャットを始める">＋ 新規</button>` : ""}</h2>`
+    + usage(key, t, items) + (ui.newOpen.has(key) ? newBox(key, t) : "");
   if (t.error) html += `<div class="err">読み込みエラー: ${esc(t.error)}</div>`;
   const head = sorted.slice(0, 20), tail = sorted.slice(20);
   html += head.map(card).join("");
@@ -523,6 +543,67 @@ function column([key, name, color], data) {
   if (hidden) html += `<div class="empty">自動実行 ${hidden} 件を非表示</div>`;
   return html + `</section>`;
 }
+
+// 新しいチャットは、ダッシュボードからフォルダと依頼文を渡して CLI で始める
+const NEW_TOOLS = ["claude", "codex"];
+function newBox(tool, t) {
+  const f = ui.newForm[tool] ||= {};
+  const hosts = (last.hosts || []).filter((h) => !h.error);
+  f.host ??= "";
+  // 選んだ端末で最近使ったフォルダを候補に出す
+  // Codex の記録は Windows で「\\?\C:\...」の形なので、頭の「\\?\」を外す。worktree の中は候補にしない
+  const cwds = [...new Set(t.items.filter((i) => (i.host || "") === f.host && i.cwd && !/[\\/]\.claude[\\/]worktrees[\\/]/.test(i.cwd))
+    .sort((a, b) => b.updated - a.updated).map((i) => i.cwd.replace(/^\\\\\?\\/, "")))].slice(0, 15);
+  f.cwd ??= cwds[0] || "";
+  const job = ui.jobs[`new:${tool}`];
+  return `<div class="reply-box new-box" data-tool="${tool}">
+    <div class="fields">
+      <span>端末</span><select name="host">${[["", "このPC"], ...hosts.map((h) => [h.name, h.name])].map(([v, n]) =>
+        `<option value="${esc(v)}" ${f.host === v ? "selected" : ""}>${esc(n)}</option>`).join("")}</select>
+      <span>フォルダ</span><input type="text" name="cwd" list="cwds-${tool}" value="${esc(f.cwd)}" placeholder="空ならホームフォルダ">
+      <datalist id="cwds-${tool}">${cwds.map((c) => `<option value="${esc(c)}">`).join("")}</datalist>
+    </div>
+    <textarea name="text" placeholder="新しいチャットで頼むこと（Tab → Enter か Ctrl+Enter で開始）">${esc(f.text || "")}</textarea>
+    <div class="row"><span class="hint" title="そのフォルダで CLI の新しいチャットを始めます。ファイル編集など許可が要る操作は、確認を出せないので止まります">許可が要る操作は止まります</span>
+      <button data-act="newcancel">やめる</button><button class="primary" data-act="newsend">開始</button></div>
+    ${job ? `<div class="job ${job.status}">${job.status === "running" ? "実行中…" : linkify(esc(job.output || (job.status === "done" ? "始めました" : "失敗しました")))}</div>` : ""}
+  </div>`;
+}
+async function sendNew(tool) {
+  const f = ui.newForm[tool] || {};
+  const text = (f.text || "").trim();
+  if (!text) return toast("依頼文を書いてください");
+  try {
+    const job = await post("/api/new", { tool, host: f.host || null, cwd: f.cwd || "", text });
+    ui.jobs[`new:${tool}`] = job;
+    f.text = "";
+    render();
+    pollJob(`new:${tool}`, job.id);
+  } catch (e) { toast(e.message); }
+}
+document.addEventListener("click", (e) => {
+  const nb = e.target.closest("[data-new]");
+  if (nb) {
+    const tool = nb.dataset.new;
+    ui.newOpen.has(tool) ? ui.newOpen.delete(tool) : ui.newOpen.add(tool);
+    render();
+    document.querySelector(`.new-box[data-tool="${tool}"] textarea`)?.focus();
+    return;
+  }
+  const btn = e.target.closest(".new-box button");
+  if (!btn) return;
+  const tool = btn.closest(".new-box").dataset.tool;
+  if (btn.dataset.act === "newcancel") { ui.newOpen.delete(tool); render(); }
+  if (btn.dataset.act === "newsend") sendNew(tool);
+});
+// 端末を変えたらフォルダの候補も変わるので描き直す
+document.addEventListener("change", (e) => {
+  const nb = e.target.closest?.(".new-box");
+  if (!nb || e.target.name !== "host") return;
+  const f = ui.newForm[nb.dataset.tool];
+  f.host = e.target.value; delete f.cwd;
+  render();
+});
 
 let last = null;
 function render() {

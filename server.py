@@ -176,14 +176,22 @@ def claude_text(content):
 
 
 def claude_question(content):
-    """アシスタントが AskUserQuestion で質問していれば、その質問と選択肢を1つの文にする"""
+    """アシスタントの質問を (文, 種類) で返す。質問がなければ (None, None)。
+    "choice": AskUserQuestion の選択式。答えは tool_result で返り、アプリの画面で選んでもらう
+    "box": デスクトップアプリの、ターンの最後に出る「次の一手」の箱の質問（wrap_up の ask）。答えは普通の返信"""
     for c in content if isinstance(content, list) else []:
-        if isinstance(c, dict) and c.get("type") == "tool_use" and c.get("name") == "AskUserQuestion":
-            qs = (c.get("input") or {}).get("questions") or []
+        if not (isinstance(c, dict) and c.get("type") == "tool_use"):
+            continue
+        inp = c.get("input") or {}
+        if c.get("name") == "AskUserQuestion":
+            qs = inp.get("questions") or []
             return "\n".join(
                 (q.get("question") or "") + "\n選択肢: " + " / ".join(o.get("label", "") for o in q.get("options") or [])
-                for q in qs if isinstance(q, dict))
-    return None
+                for q in qs if isinstance(q, dict)), "choice"
+        if str(c.get("name", "")).endswith("wrap_up") and inp.get("ask"):
+            labels = [a.get("label", "") for a in inp.get("actions") or [] if isinstance(a, dict) and a.get("label")]
+            return inp["ask"] + ("\n選択肢: " + " / ".join(labels) if labels else ""), "box"
+    return None, None
 
 
 def stop_idle_session(sid):
@@ -347,15 +355,18 @@ def collect_claude(since):
         sid = f.stem
         if mtime < since and sid not in live:
             continue
-        title = prompt = reply = cwd = entry = question = None
+        title = prompt = reply = cwd = entry = question = qkind = None
         sidechain_only = True
         turn_done = False  # 最後の発言が「応答し終えた」アシスタントか
+        # 最後の発言の時刻。ファイルの更新時刻は、アプリが題名などを書き足すだけでも新しくなるので並び順に使わない
+        msg_ts = None
         for d in tail_lines(f):
             t = d.get("type")
             entry = d.get("entrypoint") or entry
             if t in ("user", "assistant") and not d.get("isSidechain"):
                 turn_done = t == "assistant" and (d.get("message") or {}).get("stop_reason") in (
                     "end_turn", "stop_sequence", "max_tokens", "refusal")
+                msg_ts = iso_ts(d.get("timestamp")) or msg_ts
             if t == "custom-title":
                 title = d.get("customTitle") or title
             elif t == "agent-name":
@@ -366,27 +377,39 @@ def collect_claude(since):
                 cwd = d.get("cwd") or cwd
                 if not d.get("isSidechain"):
                     sidechain_only = False
-                    question = None  # 次の user 行が来た＝質問に答えた
                     txt = claude_text(d.get("message", {}).get("content"))
+                    # 選択式は tool_result が来たら答えた。箱の質問は、人が文を送ったら答えた
+                    # （箱の tool_result はターンの途中ですぐ返るので、それでは消さない）
+                    if qkind == "choice" or txt.strip():
+                        question = qkind = None
                     if txt and not txt.lstrip().startswith("<"):
                         prompt = txt
             elif t == "assistant" and not d.get("isSidechain"):
                 txt = claude_text(d.get("message", {}).get("content"))
                 if txt.strip():
                     reply = txt
-                question = claude_question(d.get("message", {}).get("content")) or question
+                q, k = claude_question(d.get("message", {}).get("content"))
+                if q:
+                    question, qkind = q, k
         lv = live.get(sid)
         if lv:
             cwd = lv.get("cwd") or cwd
             title = lv.get("name") or title
             # 質問（AskUserQuestion）への答え待ちは、履歴に未回答の質問が残っていることで見分ける
-            state = "ask" if question else "busy" if lv.get("status") == "busy" else "open"
-            updated = max(mtime, (lv.get("updatedAt") or 0) / 1000)
+            # 箱の質問は、ターンが終わって待っているときだけ質問中とみなす
+            asking = question and (qkind == "choice" or lv.get("status") != "busy")
+            state = "ask" if asking else "busy" if lv.get("status") == "busy" else "open"
+            # 動作中は今まさに動いているので起動中プロセスの時刻も使う。待機中は最後の発言の時刻
+            updated = msg_ts or mtime
+            if state == "busy":
+                updated = max(updated, (lv.get("updatedAt") or 0) / 1000)
         else:
             # 最近書かれていても、応答し終えていれば待機中。ダッシュボードから送信中のものは処理中
             sending = any(j["session"] == sid and j["status"] == "running" for j in list(JOBS.values()))
             state = "busy" if sending or (now() - mtime < ACTIVE_WINDOW and not turn_done) else "done"
-            updated = mtime
+            updated = msg_ts or mtime
+            if updated < since and state != "busy":
+                continue  # 中身が書き足されただけの古いチャットは、期間の一覧に出さない
         if cwd is None:
             cwd = "/" + f.parent.name.lstrip("-").replace("-", "/")
         usage = cached_by_stat(str(f), claude_usage) or {}
@@ -414,10 +437,11 @@ def collect_claude(since):
             # その場合はアプリで開いて本文をクリップボードに入れるだけにする
             "reply_mode": "paste" if lv else "cli",
             # 質問の画面に文字を貼ると答え方が読めないので、質問中はアプリで答えてもらう
-            "can_reply": state != "ask" and (lv is not None or state != "busy"),
-            "no_reply": "質問が出ています。アプリで開いて答えてください" if state == "ask" else None,
+            # 箱の質問には普通の返信で答えられるので、選択式のときだけ止める
+            "can_reply": not (state == "ask" and qkind == "choice") and (lv is not None or state != "busy"),
+            "no_reply": "質問が出ています。アプリで開いて答えてください" if state == "ask" and qkind == "choice" else None,
             # 待機中ならアプリ側のプロセスを止めてから CLI で送れる（会話は1本のまま。アプリには「中断」と出る）
-            "can_stop_send": lv is not None and state == "open",
+            "can_stop_send": lv is not None and (state == "open" or (state == "ask" and qkind == "box")),
             # Windows ではアプリでそのチャットを開き、貼り付けて Enter まで自動で押せる（止めずに同じ会話へ届く）
             # Mac は止めている。自動起動から Claude アプリの画面情報を問い合わせると、長時間返ってこないことがあり、
             # 宛先の確認を安定してできないため（誤送信を避けて「止めて送る」を既定にする）
@@ -1309,15 +1333,21 @@ def start_remote_reply(item, text, images, stop=False):
 
 def start_ts_reply(host, item, text, stop=False):
     """相手のダッシュボードに返信を頼み、その実行状況をこちらのジョブに写す"""
+    return relay_job(host, "/share/reply", {"tool": item["tool"], "id": item["id"], "text": text, "stop": stop},
+                     item["tool"], item["id"])
+
+
+def relay_job(host, path, body, tool, session):
+    """相手のダッシュボードに仕事を頼み、終わるまでその状況をこちらのジョブに写す"""
     job_id = uuid.uuid4().hex[:12]
     with JOBS_LOCK:
-        JOBS[job_id] = {"id": job_id, "tool": item["tool"], "session": item["id"], "host": host["name"],
+        JOBS[job_id] = {"id": job_id, "tool": tool, "session": session, "host": host["name"],
                         "status": "running", "output": "", "started": now()}
 
     def relay():
         job = JOBS[job_id]
         try:
-            remote = ts_post(host["ts"], "/share/reply", {"tool": item["tool"], "id": item["id"], "text": text, "stop": stop})
+            remote = ts_post(host["ts"], path, body)
             if remote.get("error"):
                 raise RuntimeError(remote["error"])
             deadline = now() + REPLY_TIMEOUT
@@ -1338,6 +1368,39 @@ def start_ts_reply(host, item, text, stop=False):
 
     threading.Thread(target=relay, daemon=True).start()
     return JOBS[job_id]
+
+
+# ダッシュボードから新しいチャットを始める。本文は標準入力で渡す（シェルを通さない）
+NEW_CHAT = {"claude": ["claude", "-p"], "codex": ["codex", "exec", "--skip-git-repo-check", "-"]}
+
+
+def start_new(tool, cwd, text):
+    """そのフォルダで CLI の新しいチャットを始め、返事をジョブに入れる。チャットはそのまま一覧に出る"""
+    if tool not in NEW_CHAT:
+        raise ValueError("この列では新しいチャットを始められません")
+    cwd = os.path.expanduser((cwd or "").strip()) or str(HOME)
+    if not os.path.isdir(cwd):
+        raise ValueError(f"フォルダが見つかりません: {cwd}")
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"id": job_id, "tool": tool, "session": None, "status": "running", "output": "",
+                        "started": now(), "cwd": cwd}
+    threading.Thread(target=run_job, args=(job_id, list(NEW_CHAT[tool]), text, cwd), daemon=True).start()
+    return JOBS[job_id]
+
+
+def start_new_request(data):
+    """/api/new と /share/new の共通部分。host があればその端末のダッシュボードに頼む"""
+    text = (data.get("text") or "").strip()
+    if not text:
+        raise ValueError("依頼文が空です")
+    if data.get("host"):
+        host = remote_host({"host": data["host"]})
+        if host is None or not host.get("ts"):
+            raise ValueError(f"{data['host']} に接続できません（Tailscale でつながった端末だけ使えます）")
+        return relay_job(host, "/share/new", {"tool": data.get("tool"), "cwd": data.get("cwd"), "text": text},
+                         data.get("tool"), None)
+    return start_new(data.get("tool"), data.get("cwd"), text)
 
 
 class ShareHandler(BaseHTTPRequestHandler):
@@ -1390,12 +1453,17 @@ class ShareHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         if not self.allowed():
             return
-        if urlparse(self.path).path != "/share/reply" or self.headers.get("X-Agent-Dashboard") != "1":
+        path = urlparse(self.path).path
+        if path not in ("/share/reply", "/share/new") or self.headers.get("X-Agent-Dashboard") != "1":
             self.send_error(404)
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
             data = json.loads(self.rfile.read(min(n, 1024 * 1024)) or b"{}")
+            if path == "/share/new":
+                # 頼まれた側では、さらに別の端末へは回さない
+                self.send_json(start_new_request({**data, "host": None}))
+                return
             item = INDEX.get((data.get("tool"), data.get("id"), None))
             if item is None:
                 raise ValueError("セッションが見つかりません")
@@ -1489,6 +1557,12 @@ class Handler(BaseHTTPRequestHandler):
             r = subprocess.run(["open", "-a", "Muse"], capture_output=True, text=True)
             self.send_json({"ok": True} if r.returncode == 0 else {"error": "Muse アプリが見つかりません"},
                            200 if r.returncode == 0 else 400)
+            return
+        if path == "/api/new":
+            try:
+                self.send_json(start_new_request(data))
+            except (ValueError, OSError) as e:
+                self.send_json({"error": str(e)}, 400)
             return
         item = INDEX.get((data.get("tool"), data.get("id"), data.get("host") or None))
         if item is None:
