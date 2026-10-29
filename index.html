@@ -110,6 +110,7 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
   border-radius: 50%; animation: spin .7s linear infinite; margin-right: 5px; vertical-align: -1px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .reply-box.sending button { cursor: progress; }
+.msg.reply.wait { color: var(--muted); }
 .reply-box.sending button.primary:disabled { opacity: 1; }  /* くるくるが薄くならないように */
 /* Remote Control の状態（起動中の Claude のチャットだけ）と、付いたり外れたりした記録 */
 .rc { display: inline-block; font-size: 10px; line-height: 15px; padding: 0 5px; margin-left: 6px; border-radius: 4px;
@@ -282,7 +283,8 @@ const NO_REPLY = {
 };
 // 再描画（5秒ごと）をまたいで残す UI 状態
 const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set(),
-  newOpen: new Set(), newForm: {}, sending: new Set() };  // sending: 送信を押して返事待ちの欄（カードのキーか new:道具）  // newForm[道具] = { host, cwd, text }
+  newOpen: new Set(), newForm: {}, sending: new Set(),
+  waiting: {} };  // waiting[カード] = { since, text }: ダッシュボードから送って、まだその応答が来ていない  // sending: 送信を押して返事待ちの欄（カードのキーか new:道具）  // newForm[道具] = { host, cwd, text }
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
 
@@ -334,6 +336,12 @@ function card(it) {
   const open = ui.replyOpen.has(k);
   const full = ui.expanded.has(k);
   const job = ui.jobs[k];
+  // 新しい指示への応答がまだのあいだは、前のターンの応答を隠してくるくるを出す。
+  // 送った直後はアプリが記録に書くまで少しかかるので、送った文が指示として載り、応答待ちでなくなるまで待つ
+  const w = ui.waiting[k];
+  const same = (a, b) => a && b && a.replace(/\s+/g, " ").trim().slice(0, 30) === b.replace(/\s+/g, " ").trim().slice(0, 30);
+  if (w && ((same(it.prompt, w.text) && !it.awaiting) || Date.now() / 1000 - w.since > 600)) delete ui.waiting[k];
+  const waiting = it.awaiting || !!ui.waiting[k];
   return `<div class="card ${it.state}" data-key="${esc(k)}">
     <div class="top"><span class="dot"></span><span class="title">${esc(it.title)}</span>
       ${ctxMeter(it)}<span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
@@ -341,8 +349,10 @@ function card(it) {
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
     ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
-    ${msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply)}
-    ${msgRow("応答", it.reply, it.reply_full, full, true, true)}
+    ${waiting
+      ? msgRow("指示", ui.waiting[k]?.text || it.prompt, ui.waiting[k] ? null : it.prompt_full, full, false, true)
+        + `<div class="msg reply wait"><span class="spin"></span>応答を待っています…</div>`
+      : msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply) + msgRow("応答", it.reply, it.reply_full, full, true, true)}
     <div class="actions">
       <button data-act="open" ${it.host && !it.bridge_id ? `disabled title="${esc(it.host)} のセッションは、そのマシンで開いてください"` : ""}>${openLabel(it)}</button>
       <button data-act="toggle" ${it.can_reply ? "" : `disabled title="${esc(it.no_reply || NO_REPLY[it.tool])}"`}>返信</button>
@@ -420,6 +430,7 @@ async function sendReply(it, k, stop = false) {
   try {
     const job = await post("/api/reply", { tool: it.tool, id: it.id, host: it.host, text, images, stop });
     ui.sending.delete(k);
+    ui.waiting[k] = { since: Date.now() / 1000, text };
     ui.jobs[k] = job;
     ui.drafts[k] = "";
     ui.images[k] = [];

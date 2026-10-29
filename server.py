@@ -469,6 +469,7 @@ def collect_claude(since):
         # 最後の発言の時刻。ファイルの更新時刻は、アプリが題名などを書き足すだけでも新しくなるので並び順に使わない
         msg_ts = None
         ctx = None  # 最後の応答の時点のコンテキストの量（入力 + キャッシュ読込 + キャッシュ作成）
+        last_said = None  # 最後に文を出したのが "user"（指示）か "assistant"（応答）か
         for d in tail_lines(f):
             t = d.get("type")
             entry = d.get("entrypoint") or entry
@@ -493,6 +494,7 @@ def collect_claude(since):
                         question = qkind = None
                     if txt and not txt.lstrip().startswith("<"):
                         prompt = txt
+                        last_said = "user"
             elif t == "assistant" and not d.get("isSidechain"):
                 u = (d.get("message") or {}).get("usage") or {}
                 if u:
@@ -500,6 +502,7 @@ def collect_claude(since):
                 txt = claude_text(d.get("message", {}).get("content"))
                 if txt.strip():
                     reply = txt
+                    last_said = "assistant"
                 q, k = claude_question(d.get("message", {}).get("content"))
                 if q:
                     question, qkind = q, k
@@ -531,6 +534,8 @@ def collect_claude(since):
             "model": usage.get("model"),
             "tokens": tokens_since(usage.get("days"), since),
             "context": {"tokens": ctx, "window": claude_window(usage.get("model"), ctx)} if ctx else None,
+            # 新しい指示にまだ応答の文が出ていない（いまの reply は前のターンのもの）。画面では古い応答を隠して待ちを出す
+            "awaiting": state == "busy" and last_said == "user",
             "tool": "claude",
             "id": sid,
             "title": title or clip(prompt, 60) or "(無題)",
