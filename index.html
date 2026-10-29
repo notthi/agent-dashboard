@@ -109,6 +109,13 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 .rc { display: inline-block; font-size: 10px; line-height: 15px; padding: 0 5px; margin-left: 6px; border-radius: 4px;
   border: 1px solid currentColor; vertical-align: 1px; }
 .rc.on { color: var(--open); }
+/* コンテキストの量。モデルの上限に対する割合（上限はモデル名からの推定。アプリの表示と同じ計算） */
+.ctx { white-space: nowrap; }
+.ctx .bar { display: inline-block; width: 36px; height: 4px; border-radius: 2px; background: var(--line); overflow: hidden;
+  vertical-align: 2px; margin-left: 4px; }
+.ctx .bar i { display: block; height: 100%; background: var(--c); }
+.ctx.warn .bar i { background: var(--busy); }
+.ctx.full .bar i { background: #c0392b; }
 .rc.off { color: #c0392b; }
 #rclog { position: fixed; top: 64px; right: 16px; width: min(560px, calc(100vw - 32px)); max-height: 70vh; overflow: auto;
   background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; z-index: 5;
@@ -303,6 +310,14 @@ async function copyText(text) {
   toast(ok ? "コピーしました" : "コピーできませんでした");
 }
 
+function ctxMeter(it) {
+  const c = it.context;
+  if (!c || !c.tokens || !c.window) return "";
+  const pct = Math.min(100, Math.round(c.tokens / c.window * 100));
+  const cls = pct >= 85 ? "full" : pct >= 65 ? "warn" : "";
+  // 狭い列でも「…」で隠れないよう、モデル名の行とは分けて1行で出す
+  return `<div class="meta ctx ${cls}" title="コンテキスト ${c.tokens.toLocaleString()} / 上限 ${c.window.toLocaleString()} トークン（上限はモデル名からの推定）">コンテキスト ${pct}%<span class="bar"><i style="width:${pct}%"></i></span></div>`;
+}
 function card(it) {
   const k = key(it);
   const st = STATE_LABEL[it.state] ? ` · ${STATE_LABEL[it.state]}` : "";
@@ -319,6 +334,7 @@ function card(it) {
     <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}${rc}</div>
     ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
       ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
+    ${ctxMeter(it)}
     ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
     ${msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply)}
     ${msgRow("応答", it.reply, it.reply_full, full, true, true)}

@@ -96,6 +96,14 @@ def now():
     return time.time()
 
 
+def claude_window(model, tokens):
+    """モデルのコンテキストの上限。記録に上限は残らないので、モデル名から決める（推定）。
+    Claude 5 系は 100 万、それ以外は 20 万。実際の量が上限を超えていれば 100 万とみなす"""
+    m = (model or "").lower()
+    window = 1_000_000 if ("[1m]" in m or m.startswith(("claude-opus-5", "claude-sonnet-5", "claude-fable", "claude-haiku-5"))) else 200_000
+    return 1_000_000 if tokens > window else window
+
+
 def head_cwd(path, nbytes=2_000_000):
     """履歴の先頭から、最初に記録された作業フォルダを探す"""
     try:
@@ -398,7 +406,7 @@ def claude_usage(path):
 
 def codex_usage(path):
     """rollout の token_count から日ごとのトークン数と、最新の使用制限(5時間/週)を取る"""
-    days, limits = {}, None
+    days, limits, context = {}, None, None
     with open(path, "rb") as f:
         for raw in f:
             if b'"token_count"' not in raw:
@@ -409,15 +417,18 @@ def codex_usage(path):
                 continue
             p = d.get("payload") or {}
             ts = iso_ts(d.get("timestamp"))
-            u = (p.get("info") or {}).get("last_token_usage")
+            info = p.get("info") or {}
+            u = info.get("last_token_usage")
             if u:
+                # 最後の呼び出しの入力（キャッシュ分を含む）が、その時点のコンテキストの量
+                context = {"tokens": u.get("input_tokens") or 0, "window": info.get("model_context_window")}
                 cached = u.get("cached_input_tokens") or 0
                 add_tokens(days, ts, (u.get("input_tokens") or 0) - cached,
                            u.get("output_tokens") or 0, cached)
             rl = p.get("rate_limits")
             if rl and rl.get("primary"):
                 limits = {"ts": ts, "primary": rl.get("primary"), "secondary": rl.get("secondary")}
-    return {"days": days, "limits": limits}
+    return {"days": days, "limits": limits, "context": context}
 
 
 DESKTOP_SESSIONS = CLAUDE_APP_DIR / "claude-code-sessions"
@@ -457,6 +468,7 @@ def collect_claude(since):
         turn_done = False  # 最後の発言が「応答し終えた」アシスタントか
         # 最後の発言の時刻。ファイルの更新時刻は、アプリが題名などを書き足すだけでも新しくなるので並び順に使わない
         msg_ts = None
+        ctx = None  # 最後の応答の時点のコンテキストの量（入力 + キャッシュ読込 + キャッシュ作成）
         for d in tail_lines(f):
             t = d.get("type")
             entry = d.get("entrypoint") or entry
@@ -482,6 +494,9 @@ def collect_claude(since):
                     if txt and not txt.lstrip().startswith("<"):
                         prompt = txt
             elif t == "assistant" and not d.get("isSidechain"):
+                u = (d.get("message") or {}).get("usage") or {}
+                if u:
+                    ctx = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
                 txt = claude_text(d.get("message", {}).get("content"))
                 if txt.strip():
                     reply = txt
@@ -515,6 +530,7 @@ def collect_claude(since):
         items[sid] = {
             "model": usage.get("model"),
             "tokens": tokens_since(usage.get("days"), since),
+            "context": {"tokens": ctx, "window": claude_window(usage.get("model"), ctx)} if ctx else None,
             "tool": "claude",
             "id": sid,
             "title": title or clip(prompt, 60) or "(無題)",
@@ -625,6 +641,7 @@ def collect_codex(since):
             "via": src if not src.startswith("{") else "subagent",
             "model": " ".join(x for x in (r["model"], r["reasoning_effort"]) if x) or None,
             "tokens": tokens_since(usage.get("days"), since),
+            "context": usage.get("context") if (usage.get("context") or {}).get("window") else None,
             "limits": usage.get("limits"),
             "can_reply": not r["archived"] and state != "busy",
         })
