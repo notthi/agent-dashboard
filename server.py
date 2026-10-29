@@ -648,14 +648,15 @@ _USAGE_RE = re.compile(r"Current (session|week \(all models\)): (\d+)% used(?: �
 
 
 def parse_reset(text, tz):
-    """「Oct 29 at 9:29am」「Nov 1 at 6am」「9:29am」をタイムスタンプにする"""
+    """「Oct 29 at 9:29am」「Oct 29, 9:29am」「Nov 1 at 6am」「9:29am」をタイムスタンプにする"""
     from zoneinfo import ZoneInfo
     try:
         zone = ZoneInfo(tz)
     except Exception:  # noqa: BLE001  タイムゾーン名が読めなければこのマシンの時刻で扱う
         zone = None
     now_dt = datetime.now(zone)
-    t = text.replace(" at ", " ").strip()
+    # 版によって日付と時刻の間が " at " のことも ", " のこともある
+    t = text.replace(" at ", " ").replace(", ", " ").strip()
     for fmt, has_date in (("%b %d %I:%M%p", True), ("%b %d %I%p", True), ("%I:%M%p", False), ("%I%p", False)):
         try:
             d = datetime.strptime(t, fmt)
