@@ -957,11 +957,16 @@ INDEX = {}  # (tool, id, host) -> 直近の一覧に出た item。開く・返�
 _COLLECT_LOCK = threading.Lock()
 
 
-def snapshot(days, with_remote=True, tokens=True):
+def snapshot(days, with_remote=True, tokens=True, fresh=False):
     global COUNT_TOKENS
     with _COLLECT_LOCK:
         COUNT_TOKENS = tokens
-        return _snapshot(days, with_remote)
+        out = _snapshot(days, with_remote)
+    if with_remote:
+        # 別マシンの分は、ページに戻った直後に最新を待つことがあるので、ロックの外で合わせる
+        # （ロックの中で待つと、ほかの端末からの共有の問い合わせまで待たされる）
+        merge_remote(out, days, fresh)
+    return out
 
 
 COUNT_TOKENS = True  # False なら Claude の期間のトークン数を数えない（大きな履歴を頭から読まないので軽い）
@@ -986,8 +991,6 @@ def _snapshot(days, with_remote=True):
             INDEX.update(((name, i["id"], None), i) for i in items)
         except Exception as e:  # 1つ壊れても他は表示する
             out["tools"][name] = {"items": [], "error": f"{type(e).__name__}: {e}"}
-    if with_remote:
-        merge_remote(out, days)
     return out
 
 
@@ -1036,17 +1039,30 @@ def fetch_remote(host, days):
         st["running"] = False
 
 
-def merge_remote(out, days):
+def merge_remote(out, days, fresh=False):
     out["hosts"] = []
-    for host in load_hosts() + ts_hosts():
+    hosts = load_hosts() + ts_hosts()
+    waits = []
+    for host in hosts:
         st = REMOTE.setdefault(host["name"], {"data": None, "fetched": 0, "error": None,
                                               "running": False, "days": None})
         # Tailscale の相手はダッシュボードが動いていないことも多いので、失敗したら間隔をあける
         ttl = REMOTE_TTL if (st["data"] or not host.get("ts")) else TS_RETRY
-        stale = now() - st["fetched"] > ttl or (st["days"] != days and st["data"])
+        # fresh（ページに戻った直後）は、表示したことのある相手を間隔に関係なく取り直す
+        stale = (now() - st["fetched"] > ttl or (st["days"] != days and st["data"])
+                 or (fresh and st["data"] and now() - st["fetched"] > 2))
         if stale and not st["running"]:
             st["running"] = True
-            threading.Thread(target=fetch_remote, args=(host, days), daemon=True).start()
+            t = threading.Thread(target=fetch_remote, args=(host, days), daemon=True)
+            t.start()
+            if fresh and st["data"]:
+                waits.append(t)
+    # 見ていない間は取りに行っていないので、戻った直後は最新が届くまで少し待つ（最大 3 秒。間に合わなければ前のまま）
+    deadline = time.time() + 3
+    for t in waits:
+        t.join(max(0, deadline - time.time()))
+    for host in hosts:
+        st = REMOTE[host["name"]]
         if host.get("ts") and st["data"] is None:
             continue  # 一度も応答のない端末は、ダッシュボードが無いとみなして出さない
         out["hosts"].append({"name": host["name"], "error": st["error"], "fetched": st["fetched"],
@@ -1765,7 +1781,8 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         if url.path == "/api/sessions":
-            self.send_json(snapshot(float(q.get("days", ["3"])[0]), tokens=q.get("tokens", ["1"])[0] != "0"))
+            self.send_json(snapshot(float(q.get("days", ["3"])[0]), tokens=q.get("tokens", ["1"])[0] != "0",
+                                    fresh=q.get("fresh", ["0"])[0] == "1"))
             return
         if url.path == "/api/job":
             job = JOBS.get(q.get("id", [""])[0])

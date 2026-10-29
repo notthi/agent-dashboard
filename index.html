@@ -801,7 +801,7 @@ $("#rcbtn").onclick = () => {
   box.style.top = `${document.querySelector("header").getBoundingClientRect().bottom + 6}px`;  // 折り返したヘッダーの下に出す
   loadRcLog();
 };
-setInterval(loadRcLog, 15000);
+setInterval(() => { if (!document.hidden) loadRcLog(); }, 15000);  // 見ていない間は読まない（節電）
 
 let last = null;
 function render() {
@@ -834,9 +834,10 @@ function render() {
     return hostChip(h.name, h.name, `${h.name}: ${h.error || label}`, h.error ? " ✕" : h.loading ? " …" : "", !!h.error);
   }).join("") : "";
 }
-async function load() {
+// fresh: ページに戻ったときは、別マシンの最新を取ってから返してもらう
+async function load(fresh = false) {
   try {
-    const r = await fetch(`/api/sessions?days=${$("#days").value}${$("#showTokens").checked ? "" : "&tokens=0"}`);
+    const r = await fetch(`/api/sessions?days=${$("#days").value}${$("#showTokens").checked ? "" : "&tokens=0"}${fresh ? "&fresh=1" : ""}`);
     last = await r.json();
     // 入力中に描き直すとカーソルが飛ぶので、入力欄にフォーカスがある間は保留
     // 文字を選んでいる間も、選択が消えないよう保留
@@ -856,7 +857,7 @@ $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#sho
 load();
 // 見ていない間（ほかのタブやウインドウの裏）は更新しない。電池と通信の節約。戻ってきたらすぐ更新する
 setInterval(() => { if (!document.hidden) load(); }, 5000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { load(true); loadRcLog(); } });
 </script>
 </body>
 </html>
