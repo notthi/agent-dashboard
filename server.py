@@ -480,6 +480,7 @@ def collect_claude(since):
         ctx = None  # 最後の応答の時点のコンテキストの量（入力 + キャッシュ読込 + キャッシュ作成）
         last_said = None  # 最後に文を出したのが "user"（指示）か "assistant"（応答）か
         pending_access = {}  # tool_use の id -> 許可を求める文（tool_result が来たら消す）
+        turn_msgs = []  # いまのターン（最後の指示のあと）にアシスタントが出した文。動作中のカードにログとして出す
         for d in tail_lines(f):
             t = d.get("type")
             entry = d.get("entrypoint") or entry
@@ -509,6 +510,7 @@ def collect_claude(since):
                     if txt and not txt.lstrip().startswith("<"):
                         prompt = txt
                         last_said = "user"
+                        turn_msgs = []
             elif t == "assistant" and not d.get("isSidechain"):
                 u = (d.get("message") or {}).get("usage") or {}
                 if u:
@@ -517,6 +519,7 @@ def collect_claude(since):
                 if txt.strip():
                     reply = txt
                     last_said = "assistant"
+                    turn_msgs.append({"ts": iso_ts(d.get("timestamp")), "text": clip(txt, 200)})
                 for c in d.get("message", {}).get("content") or []:
                     if isinstance(c, dict) and c.get("type") == "tool_use" and access_request(c):
                         pending_access[c.get("id")] = access_request(c)
@@ -556,6 +559,8 @@ def collect_claude(since):
             "context": {"tokens": ctx, "window": claude_window(usage.get("model"), ctx)} if ctx else None,
             # 新しい指示にまだ応答の文が出ていない（いまの reply は前のターンのもの）。画面では古い応答を隠して待ちを出す
             "awaiting": state == "busy" and last_said == "user",
+            # 動作中のターンで、いま出ている応答より前に出した文（新しい順・8件まで）
+            "turn_log": turn_msgs[-9:-1][::-1] if state in ("busy", "ask") else [],
             "tool": "claude",
             "id": sid,
             "title": title or clip(prompt, 60) or "(無題)",

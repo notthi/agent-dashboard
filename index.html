@@ -117,6 +117,11 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .reply-box.sending button { cursor: progress; }
 .msg.reply.wait { color: var(--muted); }
+/* 動作中のターンで、いまの応答より前に出た文（新しい順） */
+.turn-log { margin: 4px 0 0 16px; padding-left: 10px; border-left: 2px solid var(--line); max-height: 260px; overflow: auto; }
+.turn-log div { font-size: 12px; color: var(--muted); margin: 4px 0; display: -webkit-box; -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical; overflow: hidden; word-break: break-word; }
+.turn-log time { font-variant-numeric: tabular-nums; margin-right: 6px; opacity: .8; }
 .reply-box.sending button.primary:disabled { opacity: 1; }  /* くるくるが薄くならないように */
 /* Remote Control の状態（起動中の Claude のチャットだけ）と、付いたり外れたりした記録 */
 .rc { display: inline-block; font-size: 10px; line-height: 15px; padding: 0 5px; margin-left: 6px; border-radius: 4px;
@@ -333,6 +338,13 @@ function ctxMeter(it) {
   const cls = pct >= 85 ? "full" : pct >= 65 ? "warn" : "";
   return `<span class="ctx ${cls}" title="コンテキスト ${c.tokens.toLocaleString()} / 上限 ${c.window.toLocaleString()} トークン（上限はモデル名からの推定）"><span class="bar"><i style="width:${pct}%"></i></span> ${pct}%</span>`;
 }
+function turnLog(it) {
+  const log = it.turn_log || [];
+  if (!log.length) return "";
+  const hm = (ts) => new Date(ts * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  return `<div class="turn-log" title="このターンでここまでに出た応答（新しい順）">${log.map((m) =>
+    `<div><time>${hm(m.ts)}</time>${linkify(esc(m.text))}</div>`).join("")}</div>`;
+}
 function card(it) {
   const k = key(it);
   const st = STATE_LABEL[it.state] ? ` · ${STATE_LABEL[it.state]}` : "";
@@ -359,7 +371,7 @@ function card(it) {
     ${waiting
       ? msgRow("指示", ui.waiting[k]?.text || it.prompt, ui.waiting[k] ? null : it.prompt_full, full, false, true)
         + `<div class="msg reply wait"><span class="spin"></span>応答を待っています…</div>`
-      : msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply) + msgRow("応答", it.reply, it.reply_full, full, true, true)}
+      : msgRow("指示", it.prompt, it.prompt_full, full, false, !it.reply) + msgRow("応答", it.reply, it.reply_full, full, true, true) + turnLog(it)}
     <div class="actions">
       <button data-act="open" ${it.host && !it.bridge_id ? `disabled title="${esc(it.host)} のセッションは、そのマシンで開いてください"` : ""}>${openLabel(it)}</button>
       <button data-act="toggle" ${it.can_reply ? "" : `disabled title="${esc(it.no_reply || NO_REPLY[it.tool])}"`}>返信</button>
@@ -724,7 +736,7 @@ function render() {
   if (!last) return;
   const open = [...document.querySelectorAll("details")].map((d) => d.open);
   // 全文や返事の欄のスクロール位置を描き直しのあとも保つ
-  const scrolls = [...document.querySelectorAll(".msg.full, .job")].map((el) =>
+  const scrolls = [...document.querySelectorAll(".msg.full, .job, .turn-log")].map((el) =>
     [el.closest(".card")?.dataset.key, el.className, el.scrollTop]);
   const shown = TOOLS.filter(([k]) => !hiddenCols.has(k));
   $("#main").style.setProperty("--n", Math.max(1, shown.length));
