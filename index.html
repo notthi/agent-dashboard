@@ -117,6 +117,9 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 @keyframes spin { to { transform: rotate(360deg); } }
 .reply-box.sending button { cursor: progress; }
 .msg.reply.wait { color: var(--muted); }
+/* 「たたむ」のあいだは題名の行だけ */
+.card.folded { padding-top: 7px; padding-bottom: 7px; margin-bottom: 6px; }
+body.folding .card .top { cursor: pointer; }
 /* 動作中のターンで、いまの応答より前に出た文（新しい順） */
 .turn-log { margin: 4px 0 0 16px; padding-left: 10px; border-left: 2px solid var(--line); max-height: 260px; overflow: auto; }
 .turn-log div { font-size: 12px; color: var(--muted); margin: 4px 0; display: -webkit-box; -webkit-line-clamp: 3;
@@ -187,6 +190,12 @@ button.primary:hover:not(:disabled) { color: #fff; filter: brightness(1.08); }
 #hosts .chip { --c: var(--muted); }
 #hosts .chip.err { color: #c0392b; border-color: currentColor; --c: #c0392b; }
 .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+/* ドロップで添付した書類と、ドラッグ中の返信欄 */
+.files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.file { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; font-size: 12px; padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file button { padding: 0 5px; border: 0; font-size: 12px; }
+.reply-box.dragover textarea { border-color: var(--c); border-style: dashed; background: color-mix(in srgb, var(--c) 8%, var(--bg)); }
 .thumbs div { position: relative; }
 .thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; border: 1px solid var(--line); display: block; }
 .thumbs button { position: absolute; top: -6px; right: -6px; padding: 0 5px; border-radius: 50%; font-size: 11px;
@@ -210,6 +219,8 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
       <option value="2">小</option><option value="5">中</option><option value="10">大</option>
     </select></label>
     <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
+    <label title="切ると、このPCは期間のトークン数を数えません（大きな履歴を読まないので軽くなります）"><input type="checkbox" id="showTokens" checked> トークン数</label>
+    <button id="foldbtn" title="全部のカードを題名だけにする／元に戻す">たたむ</button>
     <button id="rcbtn" title="Remote Control が付いたり外れたりした記録">RC記録</button>
     <span id="updated"></span>
   </div>
@@ -238,6 +249,7 @@ let hiddenHosts = new Set();  // 表示しない端末（"" はこのPC）
 try {
   $("#days").value = localStorage.getItem("days") || "3";
   $("#showAuto").checked = localStorage.getItem("showAuto") === "1";
+  $("#showTokens").checked = localStorage.getItem("showTokens") !== "0";
   $("#rows").value = localStorage.getItem("rows") || "2";
   hiddenCols = new Set(JSON.parse(localStorage.getItem("hiddenCols") || "[]"));
   hiddenHosts = new Set(JSON.parse(localStorage.getItem("hiddenHosts") || "[]"));
@@ -294,8 +306,9 @@ const NO_REPLY = {
   antigravity: "実行中です",
 };
 // 再描画（5秒ごと）をまたいで残す UI 状態
-const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, expanded: new Set(),
+const ui = { replyOpen: new Set(), drafts: {}, jobs: {}, images: {}, files: {}, expanded: new Set(),
   newOpen: new Set(), newForm: {}, sending: new Set(),
+  folded: false, peek: new Set(),  // folded: 全部を題名だけにする。peek: そのあいだに開いたカード
   waiting: {} };  // waiting[カード] = { since, text }: ダッシュボードから送って、まだその応答が来ていない  // sending: 送信を押して返事待ちの欄（カードのキーか new:道具）  // newForm[道具] = { host, cwd, text }
 // 同じセッション ID が別のマシンにもあり得るので、マシン名も含める
 const key = (it) => `${it.tool}:${it.host || ""}:${it.id}`;
@@ -331,6 +344,7 @@ async function copyText(text) {
   toast(ok ? "コピーしました" : "コピーできませんでした");
 }
 
+const showTok = () => $("#showTokens").checked;  // 期間のトークン数を出すか（切るとサーバーも数えない）
 function ctxMeter(it) {
   const c = it.context;
   if (!c || !c.tokens || !c.window) return "";
@@ -361,12 +375,15 @@ function card(it) {
   const same = (a, b) => a && b && a.replace(/\s+/g, " ").trim().slice(0, 30) === b.replace(/\s+/g, " ").trim().slice(0, 30);
   if (w && ((same(it.prompt, w.text) && !it.awaiting) || Date.now() / 1000 - w.since > 600)) delete ui.waiting[k];
   const waiting = it.awaiting || !!ui.waiting[k];
+  const top = `<div class="top"${ui.folded ? ` title="クリックで${ui.peek.has(k) ? "たたむ" : "開く"}"` : ""}><span class="dot"></span><span class="title">${esc(it.title)}</span>
+      ${ctxMeter(it)}<span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>`;
+  // 「たたむ」のあいだは題名の行だけ。題名をクリックしたカードだけ開く
+  if (ui.folded && !ui.peek.has(k)) return `<div class="card folded ${it.state}" data-key="${esc(k)}">${top}</div>`;
   return `<div class="card ${it.state}" data-key="${esc(k)}">
-    <div class="top"><span class="dot"></span><span class="title">${esc(it.title)}</span>
-      ${ctxMeter(it)}<span class="time" title="${new Date(it.updated * 1000).toLocaleString()}">${ago(it.updated)}</span></div>
+    ${top}
     <div class="meta" title="${esc(it.cwd)}">${it.host ? `<span class="host">${esc(it.host)}</span>` : ""}${esc(project(it.cwd))}${via}${st}${rc}</div>
-    ${it.model || ioTok(it.tokens) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
-      ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
+    ${it.model || (showTok() && ioTok(it.tokens)) ? `<div class="meta">${it.model ? `<span class="model">${esc(it.model)}</span>` : ""}${
+      showTok() && ioTok(it.tokens) ? `<span title="${tokTitle(it.tokens)}">${it.model ? " · " : ""}${fmtTok(ioTok(it.tokens))} tokens</span>` : ""}</div>` : ""}
     ${it.question ? `<div class="msg question"><b>質問</b><div class="t">${esc(it.question)}</div></div>` : ""}
     ${waiting
       ? msgRow("指示", ui.waiting[k]?.text || it.prompt, ui.waiting[k] ? null : it.prompt_full, full, false, true)
@@ -379,7 +396,9 @@ function card(it) {
       ${it.reply ? `<button data-act="copy" title="応答の全文をコピー">応答をコピー</button>` : ""}
     </div>
     ${open ? `<div class="reply-box">
-      <textarea placeholder="このチャットに送る内容（画像は貼り付けで添付・⌘+Enter で送信）">${esc(ui.drafts[k] || "")}</textarea>
+      <textarea placeholder="このチャットに送る内容（画像は貼り付け、PDF・Excel・Word はドラッグ＆ドロップで添付・⌘+Enter で送信）">${esc(ui.drafts[k] || "")}</textarea>
+      ${(ui.files[k] || []).length ? `<div class="files">${ui.files[k].map((f, i) =>
+        `<span class="file" title="${esc(f.name)}">📄 ${esc(f.name)}<button data-act="rmfile" data-i="${i}" title="外す">×</button></span>`).join("")}</div>` : ""}
       ${(ui.images[k] || []).length ? `<div class="thumbs">${ui.images[k].map((src, i) =>
         `<div><img src="${src}" alt="添付画像 ${i + 1}"><button data-act="rmimg" data-i="${i}" title="外す">×</button></div>`).join("")}</div>` : ""}
       <div class="row"><span class="hint">${it.auto_paste
@@ -442,17 +461,19 @@ function applySending() {
 async function sendReply(it, k, stop = false) {
   const text = (ui.drafts[k] || "").trim();
   const images = ui.images[k] || [];
-  if (!text && !images.length) return;
+  const files = (ui.files[k] || []).map(({ name, data }) => ({ name, data }));
+  if (!text && !images.length && !files.length) return;
   if (ui.sending.has(k)) return;  // 二度押しで二重に送らない
   ui.sending.add(k);
   applySending();
   try {
-    const job = await post("/api/reply", { tool: it.tool, id: it.id, host: it.host, text, images, stop });
+    const job = await post("/api/reply", { tool: it.tool, id: it.id, host: it.host, text, images, files, stop });
     ui.sending.delete(k);
     ui.waiting[k] = { since: Date.now() / 1000, text };
     ui.jobs[k] = job;
     ui.drafts[k] = "";
     ui.images[k] = [];
+    ui.files[k] = [];
     ui.replyOpen.delete(k);
     render();
     pollJob(k, job.id);
@@ -474,6 +495,10 @@ document.addEventListener("click", (e) => {
   if (!cardEl || (e.target.closest(".reply-box, .job, .msg.full") && !e.target.closest("button"))) return;
   const k = cardEl.dataset.key, it = findItem(k);
   if (!it) return;
+  if (ui.folded && e.target.closest(".top")) {
+    ui.peek.has(k) ? ui.peek.delete(k) : ui.peek.add(k);
+    return render();
+  }
   const act = e.target.closest("button")?.dataset.act;
   if (act === "expand") {
     ui.expanded.has(k) ? ui.expanded.delete(k) : ui.expanded.add(k);
@@ -499,6 +524,7 @@ document.addEventListener("click", (e) => {
   if (btn.dataset.act === "send") sendReply(findItem(k), k);
   if (btn.dataset.act === "stopsend") sendReply(findItem(k), k, true);
   if (btn.dataset.act === "rmimg") { ui.images[k].splice(+btn.dataset.i, 1); render(); }
+  if (btn.dataset.act === "rmfile") { ui.files[k].splice(+btn.dataset.i, 1); render(); }
 });
 // 入力欄に画像を貼り付けると添付になる
 document.addEventListener("paste", (e) => {
@@ -518,6 +544,39 @@ document.addEventListener("paste", (e) => {
       render();
       const el = document.querySelector(`.card[data-key="${CSS.escape(k)}"] textarea`);
       if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+    };
+    r.readAsDataURL(f);
+  });
+});
+// PDF・Excel・Word・CSV を返信欄にドロップすると添付になる（画像のドロップは貼り付けと同じ扱い）
+const DOC_EXT = /\.(pdf|xlsx|xlsm|xls|docx|doc|csv)$/i;
+const dropBox = (e) => { const b = e.target.closest?.(".reply-box"); return b && !b.closest(".new-box") ? b : null; };
+document.addEventListener("dragover", (e) => {
+  if (!e.dataTransfer?.types?.includes("Files")) return;
+  e.preventDefault();  // 返信欄の外に落としても、ブラウザがそのファイルを開いて画面が移らないように
+  dropBox(e)?.classList.add("dragover");
+});
+document.addEventListener("dragleave", (e) => { dropBox(e)?.classList.remove("dragover"); });
+document.addEventListener("drop", (e) => {
+  if (!e.dataTransfer?.types?.includes("Files")) return;
+  e.preventDefault();
+  const box = dropBox(e);
+  if (!box) return toast("ファイルは、開いた返信欄に落としてください");
+  box.classList.remove("dragover");
+  const k = box.closest(".card").dataset.key, it = findItem(k);
+  const files = [...(e.dataTransfer?.files || [])];
+  if (it?.host && files.length) return toast("別の端末のチャットには、ファイルを添付できません");
+  files.forEach((f) => {
+    const isImg = f.type.startsWith("image/"), isDoc = DOC_EXT.test(f.name);
+    if (!isImg && !isDoc) return toast(`${f.name} は添付できません（PDF・Excel・Word・CSV・画像）`);
+    const list = isImg ? (ui.images[k] ||= []) : (ui.files[k] ||= []);
+    if (list.length >= 5) return toast(isImg ? "画像は5枚までです" : "ファイルは5つまでです");
+    if (f.size > (isImg ? 10 : 15) * 1024 * 1024) return toast(`${f.name} が大きすぎます（${isImg ? 10 : 15}MB まで）`);
+    const r = new FileReader();
+    r.onload = () => {
+      list.push(isImg ? r.result : { name: f.name, data: r.result });
+      render();
+      document.querySelector(`.card[data-key="${CSS.escape(k)}"] textarea`)?.focus();
     };
     r.readAsDataURL(f);
   });
@@ -565,7 +624,7 @@ function usage(key, t, items) {
   }
   const sum = { input: 0, output: 0, cache: 0 };
   items.forEach((i) => i.tokens && ["input", "output", "cache"].forEach((f) => (sum[f] += i.tokens[f])));
-  let html = `<div class="usage"><div title="${tokTitle(sum)}">${DAYS_LABEL[$("#days").value] || ""}の入出力 <b>${fmtTok(ioTok(sum))}</b> tokens（キャッシュ読込 ${fmtTok(sum.cache)}）</div>`;
+  let html = `<div class="usage">${showTok() ? `<div title="${tokTitle(sum)}">${DAYS_LABEL[$("#days").value] || ""}の入出力 <b>${fmtTok(ioTok(sum))}</b> tokens（キャッシュ読込 ${fmtTok(sum.cache)}）</div>` : ""}`;
   if (t.limits) html += limitRow("5時間枠", t.limits.primary) + limitRow("週の枠", t.limits.secondary);
   else if (key === "claude") html += `<div>5時間枠・週の枠を取得中…</div>`;
   return html + `</div>`;
@@ -723,6 +782,19 @@ async function loadRcLog() {
         <td>${esc(e.status || "")}</td></tr>`).join("") || `<tr><td>まだ記録がありません</td></tr>`}</table>`;
   } catch { box.textContent = "記録を読めませんでした"; }
 }
+function applyFold() {
+  $("#foldbtn").textContent = ui.folded ? "開く" : "たたむ";
+  document.body.classList.toggle("folding", ui.folded);
+}
+$("#foldbtn").onclick = () => {
+  ui.folded = !ui.folded;
+  ui.peek.clear();
+  try { localStorage.setItem("folded", ui.folded ? "1" : "0"); } catch {}
+  applyFold();
+  render();
+};
+try { ui.folded = localStorage.getItem("folded") === "1"; } catch {}
+applyFold();
 $("#rcbtn").onclick = () => {
   const box = $("#rclog");
   box.hidden = !box.hidden;
@@ -764,7 +836,7 @@ function render() {
 }
 async function load() {
   try {
-    const r = await fetch(`/api/sessions?days=${$("#days").value}`);
+    const r = await fetch(`/api/sessions?days=${$("#days").value}${$("#showTokens").checked ? "" : "&tokens=0"}`);
     last = await r.json();
     // 入力中に描き直すとカーソルが飛ぶので、入力欄にフォーカスがある間は保留
     // 文字を選んでいる間も、選択が消えないよう保留
@@ -779,6 +851,7 @@ $("#days").onchange = () => { try { localStorage.setItem("days", $("#days").valu
 const applyRows = () => document.documentElement.style.setProperty("--rows", $("#rows").value);
 applyRows();
 $("#rows").onchange = () => { try { localStorage.setItem("rows", $("#rows").value); } catch {} applyRows(); render(); };
+$("#showTokens").onchange = () => { try { localStorage.setItem("showTokens", $("#showTokens").checked ? "1" : "0"); } catch {} load(); };
 $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#showAuto").checked ? "1" : "0"); } catch {} render(); };
 load();
 // 見ていない間（ほかのタブやウインドウの裏）は更新しない。電池と通信の節約。戻ってきたらすぐ更新する

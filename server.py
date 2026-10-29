@@ -351,11 +351,12 @@ def cached_by_stat(path, fn):
     except OSError:
         return None
     key = (st.st_size, st.st_mtime)
-    hit = _USAGE_CACHE.get(path)
+    ck = (path, fn.__name__)  # 同じファイルを別の関数でも読むので、関数ごとに覚える
+    hit = _USAGE_CACHE.get(ck)
     if hit and hit[0] == key:
         return hit[1]
     val = fn(path)
-    _USAGE_CACHE[path] = (key, val)
+    _USAGE_CACHE[ck] = (key, val)
     return val
 
 
@@ -411,6 +412,51 @@ def claude_usage(path):
                    u.get("output_tokens") or 0,
                    u.get("cache_read_input_tokens") or 0)
     return {"model": model, "days": days}
+
+
+_CLAUDE_INC = {}  # path -> {"offset", "seen", "model"}。履歴は追記だけなので、前回の続きから読む
+
+
+def claude_usage_inc(path):
+    """claude_usage と同じ結果を、書き足された分だけ読んで出す。動作中のチャットは数秒ごとに追記されるので、
+    数百 MB の履歴を毎回頭から読み直すと、一覧の返事が数十秒かかっていた"""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    st = _CLAUDE_INC.get(path)
+    if st is None or size < st["offset"]:  # 初めて、または書き直された
+        st = _CLAUDE_INC[path] = {"offset": 0, "seen": {}, "model": None}
+    if size > st["offset"]:
+        # 1行ずつ読む（初回は数百 MB になるので、まとめて読むとメモリを食う）
+        with open(path, "rb") as f:
+            f.seek(st["offset"])
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break  # 書きかけの最後の行は、次に回す
+                st["offset"] += len(raw)
+                if b'"usage"' not in raw:
+                    continue
+                try:
+                    d = json.loads(raw)
+                except ValueError:
+                    continue
+                m = d.get("message") or {}
+                u = m.get("usage")
+                if d.get("type") != "assistant" or not u:
+                    continue
+                if m.get("model") and not m["model"].startswith("<"):
+                    st["model"] = m["model"]
+                # 使う数だけ覚える（usage をまるごと持つと、大きな履歴でメモリを食う）
+                st["seen"][m.get("id") or d.get("uuid")] = (
+                    iso_ts(d.get("timestamp")),
+                    (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0),
+                    u.get("output_tokens") or 0,
+                    u.get("cache_read_input_tokens") or 0)
+    days = {}
+    for ts, inp, out, cache in st["seen"].values():
+        add_tokens(days, ts, inp, out, cache)
+    return {"model": st["model"], "days": days}
 
 
 def codex_usage(path):
@@ -479,6 +525,7 @@ def collect_claude(since):
         msg_ts = None
         ctx = None  # 最後の応答の時点のコンテキストの量（入力 + キャッシュ読込 + キャッシュ作成）
         last_said = None  # 最後に文を出したのが "user"（指示）か "assistant"（応答）か
+        tail_model = None  # 末尾の応答のモデル。トークン数を数えないときもモデル名は出す
         pending_access = {}  # tool_use の id -> 許可を求める文（tool_result が来たら消す）
         turn_msgs = []  # いまのターン（最後の指示のあと）にアシスタントが出した文。動作中のカードにログとして出す
         for d in tail_lines(f):
@@ -512,6 +559,9 @@ def collect_claude(since):
                         last_said = "user"
                         turn_msgs = []
             elif t == "assistant" and not d.get("isSidechain"):
+                mm = (d.get("message") or {}).get("model") or ""
+                if mm and not mm.startswith("<"):
+                    tail_model = mm
                 u = (d.get("message") or {}).get("usage") or {}
                 if u:
                     ctx = sum(u.get(k) or 0 for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
@@ -552,11 +602,13 @@ def collect_claude(since):
             # 末尾だけでは作業フォルダが分からない（大きな履歴）ときは、先頭から探す。
             # フォルダ名から推すと日本語が「-」に化けて存在しないパスになり、返信が別のフォルダで動いてしまう
             cwd = cached_by_stat(str(f), head_cwd) or "/" + f.parent.name.lstrip("-").replace("-", "/")
-        usage = cached_by_stat(str(f), claude_usage) or {}
+        # トークン数を数えない設定のときは、履歴を頭から読まない（モデル名は末尾から取る）
+        usage = (claude_usage_inc(str(f)) or {}) if COUNT_TOKENS else {}
+        model = usage.get("model") or tail_model
         items[sid] = {
-            "model": usage.get("model"),
+            "model": model,
             "tokens": tokens_since(usage.get("days"), since),
-            "context": {"tokens": ctx, "window": claude_window(usage.get("model"), ctx)} if ctx else None,
+            "context": {"tokens": ctx, "window": claude_window(model, ctx)} if ctx else None,
             # 新しい指示にまだ応答の文が出ていない（いまの reply は前のターンのもの）。画面では古い応答を隠して待ちを出す
             "awaiting": state == "busy" and last_said == "user",
             # 動作中のターンで、いま出ている応答より前に出した文（新しい順・8件まで）
@@ -900,7 +952,22 @@ COLLECTORS = {
 INDEX = {}  # (tool, id, host) -> 直近の一覧に出た item。開く・返信の対象はここにあるものだけ
 
 
-def snapshot(days, with_remote=True):
+# 一覧は画面・別の端末・自分の確認から同時に頼まれる。並べて集めると、それぞれが数百 MB の履歴を
+# 頭から読み合って何倍も遅くなるので、1つずつ集める（2つ目からは書き足された分を読むだけで済む）
+_COLLECT_LOCK = threading.Lock()
+
+
+def snapshot(days, with_remote=True, tokens=True):
+    global COUNT_TOKENS
+    with _COLLECT_LOCK:
+        COUNT_TOKENS = tokens
+        return _snapshot(days, with_remote)
+
+
+COUNT_TOKENS = True  # False なら Claude の期間のトークン数を数えない（大きな履歴を頭から読まないので軽い）
+
+
+def _snapshot(days, with_remote=True):
     since = now() - days * 86400
     out = {"generated": now(), "days": days, "tools": {}}
     for name, fn in COLLECTORS.items():
@@ -1195,6 +1262,39 @@ def save_images(images):
     return paths
 
 
+# 返信に添えられる書類。保存して、本文にパスを添えて読んでもらう
+DOC_TYPES = (".pdf", ".xlsx", ".xlsm", ".xls", ".docx", ".doc", ".csv")
+MAX_DOCS, MAX_DOC_BYTES = 5, 15 * 1024 * 1024
+
+
+def save_files(files):
+    """[{name, data(data URL)}] の書類を保存してパスを返す。元の名前を残すので、読む側が何の書類か分かる"""
+    paths = []
+    for f in (files or [])[:MAX_DOCS]:
+        name = os.path.basename(str((f or {}).get("name") or ""))
+        stem, ext = os.path.splitext(name)
+        if ext.lower() not in DOC_TYPES:
+            raise ValueError("添付できるのは PDF・Excel・Word・CSV です")
+        m = re.match(r"data:[^;,]*;base64,(.+)", (f or {}).get("data") or "", re.S)
+        if not m:
+            raise ValueError("添付ファイルを読めませんでした")
+        data = base64.b64decode(m.group(1))
+        if len(data) > MAX_DOC_BYTES:
+            raise ValueError(f"{name} が大きすぎます（1つ 15MB まで）")
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        safe = re.sub(r"[^\w.\-]+", "_", stem)[:60] or "file"
+        p = UPLOAD_DIR / f"{datetime.now():%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}-{safe}{ext.lower()}"
+        p.write_bytes(data)
+        paths.append(str(p))
+    return paths
+
+
+def with_file_paths(text, paths):
+    if not paths:
+        return text
+    return text + "\n\n添付ファイル（このファイルを読んで確認してください）:\n" + "\n".join(paths)
+
+
 def with_image_paths(text, paths):
     # 画像を直接渡せないツールには、ファイルを読んでもらう
     if not paths:
@@ -1207,7 +1307,7 @@ def reply_command(item, text, images=()):
     tool, sid = item["tool"], item["id"]
     if tool == "claude":
         # 作業フォルダ外の画像も確認なしで読めるよう、保存先を許可フォルダに足す
-        extra = ["--add-dir", str(UPLOAD_DIR)] if images else []
+        extra = ["--add-dir", str(UPLOAD_DIR)] if images or str(UPLOAD_DIR) in text else []
         return ["claude", "-p", "--resume", sid, *extra], with_image_paths(text, images)
     if tool == "codex":
         # `codex queue` は次にスレッドを開くまで実行されないので、その場で続きを実行する
@@ -1216,7 +1316,7 @@ def reply_command(item, text, images=()):
     text = with_image_paths(text, images)
     if tool == "antigravity":
         # 画像の保存先をワークスペースに加えて、確認なしで読めるようにする
-        extra = ["--add-dir", str(UPLOAD_DIR)] if images else []
+        extra = ["--add-dir", str(UPLOAD_DIR)] if images or str(UPLOAD_DIR) in text else []
         return ["agy", "--conversation", sid, *extra, f"-p={text}"], None
     raise ValueError(tool)
 
@@ -1665,7 +1765,7 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
         if url.path == "/api/sessions":
-            self.send_json(snapshot(float(q.get("days", ["3"])[0])))
+            self.send_json(snapshot(float(q.get("days", ["3"])[0]), tokens=q.get("tokens", ["1"])[0] != "0"))
             return
         if url.path == "/api/job":
             job = JOBS.get(q.get("id", [""])[0])
@@ -1692,7 +1792,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 60 * 1024 * 1024:  # 画像5枚 + base64 の膨らみぶん
+            if n > 180 * 1024 * 1024:  # 画像5枚・書類5つ + base64 の膨らみぶん
                 raise ValueError("too large")
             data = json.loads(self.rfile.read(n) or b"{}")
         except ValueError:
@@ -1732,9 +1832,14 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/reply":
                 text = (data.get("text") or "").strip()
                 images = data.get("images") or []
-                if not text and not images:
+                files = data.get("files") or []
+                if not text and not images and not files:
                     raise ValueError("本文が空です")
-                self.send_json(start_reply(item, text or "この画像を見てください", images, stop=bool(data.get("stop"))))
+                if files and item.get("host"):
+                    raise ValueError("別の端末のチャットには、ファイルを添付できません（そのPCにファイルがないため）")
+                # 書類はこのPCに保存し、本文にパスを添える（どの送り方でも読めるように、ここで本文に入れる）
+                text = with_file_paths(text or ("この画像を見てください" if images else "このファイルを見てください"), save_files(files))
+                self.send_json(start_reply(item, text, images, stop=bool(data.get("stop"))))
             else:
                 self.send_error(404)
         except (ValueError, subprocess.CalledProcessError, OSError) as e:
