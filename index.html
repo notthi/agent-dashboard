@@ -508,21 +508,17 @@ function column([key, name, color], data) {
   const all = t.items.filter((i) => !hiddenHosts.has(i.host || ""));
   const items = all.filter((i) => showAuto || !i.auto);
   const hidden = all.length - items.length;
-  // 質問に答えないと進まないものを先頭に
-  const active = items.filter((i) => i.state === "ask").concat(items.filter((i) => i.state === "busy" || i.state === "open"));
-  const rest = items.filter((i) => !active.includes(i));
+  // 状態で分けず、更新の新しい順に1本で並べる（開いている／終わったの色の違いが分かりにくいため）
+  const sorted = [...items].sort((a, b) => b.updated - a.updated);
   const busy = items.filter((i) => i.state === "busy").length;
   const asking = items.filter((i) => i.state === "ask").length;
   let html = `<section class="col" style="--c:${color}">
     <h2><span class="swatch"></span>${name}<span class="count">${items.length}件</span>
     ${busy ? `<span class="live">● ${busy} 動作中</span>` : ""}${asking ? `<span class="asking">● ${asking} 質問あり</span>` : ""}</h2>` + usage(key, t, items);
   if (t.error) html += `<div class="err">読み込みエラー: ${esc(t.error)}</div>`;
-  if (active.length) html += `<div class="section-label">いま</div>` + active.map(card).join("");
-  if (rest.length) {
-    const head = rest.slice(0, 15), tail = rest.slice(15);
-    html += `<div class="section-label">最近</div>` + head.map(card).join("");
-    if (tail.length) html += `<details><summary>さらに ${tail.length} 件</summary>${tail.map(card).join("")}</details>`;
-  }
+  const head = sorted.slice(0, 20), tail = sorted.slice(20);
+  html += head.map(card).join("");
+  if (tail.length) html += `<details><summary>さらに ${tail.length} 件</summary>${tail.map(card).join("")}</details>`;
   if (!items.length) html += `<div class="empty">この期間のセッションはありません</div>`;
   if (hidden) html += `<div class="empty">自動実行 ${hidden} 件を非表示</div>`;
   return html + `</section>`;
