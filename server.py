@@ -202,6 +202,15 @@ def claude_text(content):
     return "\n".join(parts)
 
 
+def access_request(c):
+    """画面操作（computer use）の許可の求め。答えるまで履歴には求めた行しか残らない（実行中と見分けられる唯一の許可）"""
+    if not str(c.get("name", "")).endswith("request_access"):
+        return None
+    inp = c.get("input") or {}
+    apps = [os.path.basename(str(a)) for a in inp.get("apps") or []]
+    return "画面操作の許可を待っています" + (f": {', '.join(apps)}" if apps else "") + (f"\n{inp['reason']}" if inp.get("reason") else "")
+
+
 def claude_question(content):
     """アシスタントの質問を (文, 種類) で返す。質問がなければ (None, None)。
     "choice": AskUserQuestion の選択式。答えは tool_result で返り、アプリの画面で選んでもらう
@@ -470,6 +479,7 @@ def collect_claude(since):
         msg_ts = None
         ctx = None  # 最後の応答の時点のコンテキストの量（入力 + キャッシュ読込 + キャッシュ作成）
         last_said = None  # 最後に文を出したのが "user"（指示）か "assistant"（応答）か
+        pending_access = {}  # tool_use の id -> 許可を求める文（tool_result が来たら消す）
         for d in tail_lines(f):
             t = d.get("type")
             entry = d.get("entrypoint") or entry
@@ -487,7 +497,11 @@ def collect_claude(since):
                 cwd = d.get("cwd") or cwd
                 if not d.get("isSidechain"):
                     sidechain_only = False
-                    txt = claude_text(d.get("message", {}).get("content"))
+                    content = d.get("message", {}).get("content")
+                    for c in content if isinstance(content, list) else []:
+                        if isinstance(c, dict) and c.get("type") == "tool_result":
+                            pending_access.pop(c.get("tool_use_id"), None)
+                    txt = claude_text(content)
                     # 選択式は tool_result が来たら答えた。箱の質問は、人が文を送ったら答えた
                     # （箱の tool_result はターンの途中ですぐ返るので、それでは消さない）
                     if qkind == "choice" or txt.strip():
@@ -503,6 +517,9 @@ def collect_claude(since):
                 if txt.strip():
                     reply = txt
                     last_said = "assistant"
+                for c in d.get("message", {}).get("content") or []:
+                    if isinstance(c, dict) and c.get("type") == "tool_use" and access_request(c):
+                        pending_access[c.get("id")] = access_request(c)
                 q, k = claude_question(d.get("message", {}).get("content"))
                 if q:
                     question, qkind = q, k
@@ -511,6 +528,9 @@ def collect_claude(since):
             cwd = lv.get("cwd") or cwd
             title = lv.get("name") or title
             # 質問（AskUserQuestion）への答え待ちは、履歴に未回答の質問が残っていることで見分ける
+            # 画面操作の許可を求めたまま答えがなければ、処理中に見えても人の答え待ち（アプリで許可する）
+            if pending_access and lv.get("status") == "busy":
+                question, qkind = list(pending_access.values())[-1], "choice"
             # 箱の質問は、ターンが終わって待っているときだけ質問中とみなす
             asking = question and (qkind == "choice" or lv.get("status") != "busy")
             state = "ask" if asking else "busy" if lv.get("status") == "busy" else "open"
