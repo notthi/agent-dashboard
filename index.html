@@ -423,8 +423,7 @@ function card(it) {
           : "CLI で続きを実行し、返事をここに表示します"}</span>
         <button data-act="cancel">やめる</button>${stopDefault(it)
           ? `<button data-act="send" title="アプリ（または claude.ai）で開いて、本文をコピーします">開いてコピー</button><button class="primary" data-act="stopsend">送信</button>`
-          : `${it.auto_paste && it.can_stop_send
-            ? `<button data-act="stopsend" title="アプリ側のチャットを止めて裏で送ります。返事はここに出ます（アプリには「中断」と出ます）">止めて送る</button>` : ""}<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
+          : `<button class="primary" data-act="send">${isPaste(it) && !it.auto_paste ? "開いてコピー" : "送信"}</button>`}</div>
     </div>` : ""}
     ${job ? `<div class="job-wrap"><div class="job ${job.status}">${job.status === "running" ? `<span class="spin"></span>実行中…` : linkify(esc(job.output || (job.status === "done" ? "送信しました" : "失敗しました")))}</div>
       ${job.status !== "running" ? `<span class="job-btns">${job.status === "done" && job.output ? `<button data-act="copyjob" title="この返事をコピー">コピー</button>` : ""}<button data-act="closejob" title="閉じる">×</button></span>` : ""}</div>` : ""}
