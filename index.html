@@ -7,13 +7,13 @@
 <style>
 :root {
   --bg: #f6f5f2; --panel: #ffffff; --line: #e4e1da; --text: #1f1e1c; --muted: #77736b;
-  --claude: #c96442; --codex: #3d6fd8; --antigravity: #2f9e74; --muse: #8a5cf6;
+  --claude: #c96442; --codex: #3d6fd8; --antigravity: #2f9e74;
   --busy: #e0a100; --open: #3d9a5c; --done: #b5b0a6; --ask: #d6336c;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #161514; --panel: #201f1d; --line: #34322e; --text: #ece9e3; --muted: #9a958b;
-    --claude: #e08463; --codex: #7aa2f2; --antigravity: #5cc79d; --muse: #a98bfa; --done: #5d5a54;
+    --claude: #e08463; --codex: #7aa2f2; --antigravity: #5cc79d; --done: #5d5a54;
   }
 }
 * { box-sizing: border-box; }
@@ -140,15 +140,6 @@ body.folding .card .top { cursor: pointer; }
 .ctx.warn .bar i { background: var(--busy); }
 .ctx.full .bar i { background: #c0392b; }
 .rc.off { color: #c0392b; }
-#rclog { position: fixed; top: 64px; right: 16px; width: min(560px, calc(100vw - 32px)); max-height: 70vh; overflow: auto;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; z-index: 5;
-  box-shadow: 0 8px 24px rgba(0,0,0,.25); font-size: 12px; }
-#rclog[hidden] { display: none; }
-#rclog table { width: 100%; border-collapse: collapse; }
-#rclog td { padding: 3px 6px; border-top: 1px solid var(--line); white-space: nowrap; }
-#rclog td.name { white-space: normal; }
-#rclog .ev-off, #rclog .ev-end { color: #c0392b; }
-#rclog .ev-on, #rclog .ev-start-on { color: var(--open); }
 /* 列の見出しの「＋ 新規」と、新しいチャットの入力欄 */
 .col h2 { flex-wrap: wrap; row-gap: 4px; }
 .col h2 .count, .col h2 .live, .col h2 .asking { white-space: nowrap; }
@@ -222,19 +213,16 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; margin:
     <label><input type="checkbox" id="showAuto"> 自動実行も表示</label>
     <label title="切ると、このPCは期間のトークン数を数えません（大きな履歴を読まないので軽くなります）"><input type="checkbox" id="showTokens" checked> トークン数</label>
     <button id="foldbtn" title="全部のカードを題名だけにする／元に戻す">たたむ</button>
-    <button id="rcbtn" title="Remote Control が付いたり外れたりした記録">RC記録</button>
     <span id="updated"></span>
   </div>
 </header>
 <main id="main"></main>
-<div id="rclog" hidden></div>
 <div class="toast" id="toast"></div>
 <script>
 const TOOLS = [
   ["claude", "Claude Code", "var(--claude)"],
   ["codex", "Codex", "var(--codex)"],
   ["antigravity", "Antigravity", "var(--antigravity)"],
-  ["muse", "Muse", "var(--muse)"],
 ];
 const STATE_LABEL = { ask: "質問あり", busy: "動作中", open: "開いている", done: "", archived: "アーカイブ" };
 const $ = (s) => document.querySelector(s);
@@ -660,24 +648,6 @@ function rings(data) {
     return `<div class="ring-group" title="${name}">${ring("5h", l.primary, color, name)}${ring("1W", l.secondary, color, name)}</div>`;
   }).join("");
 }
-// Muse は会話がパソコンに残らないので、一覧ではなくアプリの呼び出し口だけ
-// アプリは Mac 版のみ。Windows ではサーバー側が Web 版を開く（ダッシュボードは localhost で見るので UA で判断できる）
-const IS_WIN_UA = /Windows/.test(navigator.userAgent);
-function museColumn(name, color) {
-  return `<section class="col" style="--c:${color}">
-    <h2><span class="swatch"></span>${name}</h2>
-    <div class="card launcher" data-act="muse">
-      <div class="msg" style="margin-left:0">会話は Meta のサーバーにだけあるため、ここには一覧を出せません。</div>
-      <div class="actions" style="margin-left:0"><button class="primary" data-act="muse">Muse を開く</button></div>
-      <div class="meta" style="margin-left:0;white-space:normal">${IS_WIN_UA ? "Windows ではブラウザで Web 版（muse.ai）を開きます" : "画面を左右に並べるには、Muse のウインドウ左上の緑ボタンを長押し →「画面の右半分に配置」"}</div>
-    </div>
-  </section>`;
-}
-document.addEventListener("click", async (e) => {
-  if (!e.target.closest('[data-act="muse"]')) return;
-  try { await post("/api/open", { tool: "muse" }); toast("Muse を開きました"); }
-  catch (err) { toast(err.message); }
-});
 const query = () => $("#q").value.toLowerCase().split(/\s+/).filter(Boolean);
 function matchQuery(it) {
   const words = query();
@@ -688,7 +658,6 @@ function matchQuery(it) {
 }
 $("#q").addEventListener("input", () => render());
 function column([key, name, color], data) {
-  if (key === "muse") return museColumn(name, color);
   const t = data.tools[key] || { items: [] };
   const showAuto = $("#showAuto").checked;
   const all = t.items.filter((i) => !hiddenHosts.has(i.host || ""));
@@ -782,19 +751,6 @@ document.addEventListener("change", (e) => {
 });
 
 // Remote Control の記録。開いている間は 15 秒ごとに読み直す
-const RC_EVENT = { "on": "オンになった", "off": "オフになった", "start-on": "起動（オン）", "start-off": "起動（オフ）", "end": "終了" };
-async function loadRcLog() {
-  const box = $("#rclog");
-  if (box.hidden) return;
-  try {
-    const { events } = await fetch("/api/rclog").then((r) => r.json());
-    box.innerHTML = `<b>Remote Control の記録</b>（新しい順・この画面を開いていないときも 15 秒ごとに記録）
-      <table>${(events || []).map((e) => `<tr class="ev-${esc(e.event)}">
-        <td>${new Date(e.ts * 1000).toLocaleString([], { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit", second: "2-digit" })}</td>
-        <td>${esc(e.host || "このPC")}</td><td class="name">${esc(e.name)}</td><td>${esc(RC_EVENT[e.event] || e.event)}</td>
-        <td>${esc(e.status || "")}</td></tr>`).join("") || `<tr><td>まだ記録がありません</td></tr>`}</table>`;
-  } catch { box.textContent = "記録を読めませんでした"; }
-}
 function applyFold() {
   $("#foldbtn").textContent = ui.folded ? "開く" : "たたむ";
   document.body.classList.toggle("folding", ui.folded);
@@ -808,13 +764,6 @@ $("#foldbtn").onclick = () => {
 };
 try { ui.folded = localStorage.getItem("folded") === "1"; } catch {}
 applyFold();
-$("#rcbtn").onclick = () => {
-  const box = $("#rclog");
-  box.hidden = !box.hidden;
-  box.style.top = `${document.querySelector("header").getBoundingClientRect().bottom + 6}px`;  // 折り返したヘッダーの下に出す
-  loadRcLog();
-};
-setInterval(() => { if (!document.hidden) loadRcLog(); }, 15000);  // 見ていない間は読まない（節電）
 
 let last = null;
 function render() {
@@ -870,7 +819,7 @@ $("#showAuto").onchange = () => { try { localStorage.setItem("showAuto", $("#sho
 load();
 // 見ていない間（ほかのタブやウインドウの裏）は更新しない。電池と通信の節約。戻ってきたらすぐ更新する
 setInterval(() => { if (!document.hidden) load(); }, 5000);
-document.addEventListener("visibilitychange", () => { if (!document.hidden) { load(true); loadRcLog(); } });
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { load(true); } });
 </script>
 </body>
 </html>

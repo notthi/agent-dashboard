@@ -1895,16 +1895,6 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "bad request"}, 400)
             return
         path = urlparse(self.path).path
-        if data.get("tool") == "muse" and path == "/api/open":
-            # Muse は会話がローカルに無いので一覧は出せない。アプリを呼び出すだけ
-            if not IS_MAC:
-                open_url("https://muse.ai/")  # アプリは Mac 版のみなので Web 版を開く
-                self.send_json({"ok": True})
-                return
-            r = subprocess.run(["open", "-a", "Muse"], capture_output=True, text=True)
-            self.send_json({"ok": True} if r.returncode == 0 else {"error": "Muse アプリが見つかりません"},
-                           200 if r.returncode == 0 else 400)
-            return
         if path == "/api/new":
             try:
                 self.send_json(start_new_request(data))
