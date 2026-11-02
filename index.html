@@ -180,6 +180,7 @@ body.folding .card .top { cursor: pointer; }
 #hosts { display: flex; gap: 6px; padding-left: 12px; border-left: 1px solid var(--line); }
 #hosts:empty { display: none; }
 #hosts .chip { --c: var(--muted); }
+#hosts .chip.all { padding-left: 10px; }
 #hosts .chip.err { color: #c0392b; border-color: currentColor; --c: #c0392b; }
 .thumbs { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 /* ドロップで添付した書類と、ドラッグ中の返信欄 */
@@ -234,21 +235,22 @@ const linkify = (html) => html.replace(URL_RE, (u, at, all) =>
   all[at + u.length] === "…" ? u : `<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`);
 
 let hiddenCols = new Set();
-let hiddenHosts = new Set();  // 表示しない端末（"" はこのPC）
+let onlyHost = null;  // 表示する端末（null は全PC、"" はこのPC）
 try {
   $("#days").value = localStorage.getItem("days") || "3";
   $("#showAuto").checked = localStorage.getItem("showAuto") === "1";
   $("#showTokens").checked = localStorage.getItem("showTokens") !== "0";
   $("#rows").value = localStorage.getItem("rows") || "2";
   hiddenCols = new Set(JSON.parse(localStorage.getItem("hiddenCols") || "[]"));
-  hiddenHosts = new Set(JSON.parse(localStorage.getItem("hiddenHosts") || "[]"));
+  onlyHost = JSON.parse(localStorage.getItem("onlyHost") || "null");
 } catch {}
 $("#cols").innerHTML = TOOLS.map(([k, name, color]) =>
   `<label class="chip" style="--c:${color}" title="${name} の列を表示/非表示">
     <input type="checkbox" value="${k}" ${hiddenCols.has(k) ? "" : "checked"}><span class="sw"></span>${name}</label>`).join("");
 $("#hosts").onchange = (e) => {
-  e.target.checked ? hiddenHosts.delete(e.target.value) : hiddenHosts.add(e.target.value);
-  try { localStorage.setItem("hiddenHosts", JSON.stringify([...hiddenHosts])); } catch {}
+  // 押したパソコンだけを表示。「全PC」で全部に戻す
+  onlyHost = e.target.dataset.all ? null : e.target.value;
+  try { localStorage.setItem("onlyHost", JSON.stringify(onlyHost)); } catch {}
   render();
 };
 $("#cols").onchange = (e) => {
@@ -660,7 +662,7 @@ $("#q").addEventListener("input", () => render());
 function column([key, name, color], data) {
   const t = data.tools[key] || { items: [] };
   const showAuto = $("#showAuto").checked;
-  const all = t.items.filter((i) => !hiddenHosts.has(i.host || ""));
+  const all = t.items.filter((i) => onlyHost === null || (i.host || "") === onlyHost);
   const items = all.filter((i) => showAuto || !i.auto);
   const hidden = all.length - items.length;
   // キーワードは画面が持っている分（題名・最後の指示と応答など）から探すだけなので、サーバーの負担は増えない
@@ -789,12 +791,13 @@ function render() {
   // 端末ごとの表示切り替え（つながっている別の端末があるときだけ出す）。名前の後ろの … ✕ は接続状態
   const hosts = last.hosts || [];
   const hostChip = (value, name, title, mark = "", err = false) =>
-    `<label class="chip${err ? " err" : ""}" title="${esc(title)}（クリックで表示/非表示）">
-      <input type="checkbox" value="${esc(value)}" ${hiddenHosts.has(value) ? "" : "checked"}><span class="sw"></span>${esc(name)}${mark}</label>`;
+    `<label class="chip${err ? " err" : ""}" title="${esc(title)}（クリックでこのパソコンだけ表示）">
+      <input type="checkbox" value="${esc(value)}" ${onlyHost === null || onlyHost === value ? "checked" : ""}><span class="sw"></span>${esc(name)}${mark}</label>`;
   $("#hosts").innerHTML = hosts.length ? hostChip("", "このPC", "このPC のチャット") + hosts.map((h) => {
     const label = h.error ? "接続できません" : h.loading ? "読み込み中" : `${ago(h.fetched)}に取得`;
     return hostChip(h.name, h.name, `${h.name}: ${h.error || label}`, h.error ? " ✕" : h.loading ? " …" : "", !!h.error);
-  }).join("") : "";
+  }).join("") + `<label class="chip all" title="全部のパソコンのチャットを表示">
+      <input type="checkbox" data-all="1" ${onlyHost === null ? "checked" : ""}>全PC</label>` : "";
 }
 // fresh: ページに戻ったときは、別マシンの最新を取ってから返してもらう
 async function load(fresh = false) {
